@@ -1,0 +1,729 @@
+asyncapi: 2.6.0
+info:
+  title: Impulse Buy Realtime API
+  version: 1.0.0
+  description: |
+    One WebSocket per player, per room. This socket is PUSH-ONLY.
+
+    The server owns phase transitions, timers, drip schedules, lock
+    timestamps, scoring, and vote tallies. Clients send gameplay inputs
+    (open card, draft value, touch, lock, vote, votekick) exclusively via
+    the REST API in the companion OpenAPI document. This split keeps every
+    mutation on one clamped, rate-limited, authenticated path.
+
+    ## Connection handshake
+
+    1. `POST /ws/ticket` (REST, authenticated with `X-Session-Token`)
+       returns `{ ticket, expiresAt }`. The ticket is single-use and valid
+       for 60 seconds. Because it is short-lived and consumable once, a
+    ticket that leaks into a proxy or access log cannot open a durable
+       session; the long-lived session token never appears in a URL.
+    2. Connect to `wss://…/ws/{roomCode}?ticket={ticket}`.
+    3. The first frame is ALWAYS `hello`. It carries the current room
+       sequence number and a `resync` block.
+
+    ## Missed-event recovery (no replay)
+
+    Every event carries a room-scoped, strictly monotonic `seq`, including
+    heartbeats. Events are delivered in `seq` order.
+
+    There is no event replay channel and no client-to-server resync frame.
+    If a reconnecting client's last known `seq` is behind the `seq` in
+    `hello`, `resync.required` is true and the client must fetch
+    `GET /games/current/snapshot` (REST) — the authoritative, per-phase,
+    per-player redacted state: phase, deadlines, queue position, active
+    card, draft value, lock status, current slide, and vote options. The
+    snapshot is the recovery mechanism; the stream is a live view.
+
+    ## Audiences
+
+    `x-audience: room` events are sent to every connection.
+    `x-audience: player` events are filtered per connection: a player
+    never receives another player's drip, lock, or progress events, and
+    no event ever carries another player's guess VALUE. Progress is
+    counts only (anti-herding). Scores appear nowhere on this stream
+    until `phase_changed` to FINAL.
+
+    ## Disconnect policy (server-enforced, no client action required)
+
+    * The server pings every 15s and drops a connection with no pong
+      within 30s (close 4504). The player is then marked disconnected
+      with a rejoin grace period of 120s.
+    * A disconnected player's ACTIVE card keeps running to its own 20s
+      cap. At the cap, the server auto-locks the last server-known draft
+      value if the slider was touched; otherwise the card scores zero.
+    * Unopened remaining cards: if the player does not rejoin within the
+      grace period, they score zero and the game advances. The server
+      NEVER blocks the all-done condition on a disconnected player past
+      grace — other players cannot be stranded waiting.
+
+    ## Close codes
+
+    | code | meaning                                                        |
+    |------|----------------------------------------------------------------|
+    | 1000 | Normal close (room closed after TTL or abandonment).           |
+    | 4400 | Client sent an application frame. This socket is push-only.    |
+    | 4401 | Missing, invalid, expired, or already-used ticket.             |
+    | 4403 | Ticket's session does not belong to this room, or seat revoked. |
+    | 4404 | Room not found or TTL-expired.                                 |
+    | 4410 | Connection replaced: a newer connection for the same session.  |
+    | 4411 | Room migrated by replay: reconnect to the new room code.       |
+    | 4504 | Idle/stalled connection dropped by the server.                 |
+
+    ## Rate limiting
+
+    The server coalesces high-frequency progress events (at most one
+    `author_progress` / `guess_progress` / `vote_progress` / 
+    `votekick_progress` per recipient per 500ms) and may drop 4504 on
+    stalled consumers. Input rate limiting happens on the REST path.
+  license:
+    name: Proprietary
+
+servers:
+  production:
+    url: wss://api.impulsebuy.example/v1
+    protocol: websocket
+    description: Production realtime endpoint.
+    security:
+      - wsTicket: []
+
+defaultContentType: application/json
+
+channels:
+  /ws/{roomCode}:
+    description: |
+      The single multiplexed event stream for one room. All event types
+      travel on this one channel, multiplexed by the `type` discriminator.
+      There is NO client-to-server publish operation: any application
+      frame received from the client triggers an `error` event followed
+      by close 4400. Protocol-level ping/pong frames are permitted and
+      expected.
+    parameters:
+      roomCode:
+        description: 4-character room code.
+        schema:
+          type: string
+          minLength: 4
+          maxLength: 4
+          pattern: "^[A-Z0-9]{4}$"
+        location: $message.payload#/roomCode
+    subscribe:
+      operationId: receiveRoomEvents
+      summary: Receive server events for your room and seat
+      description: |
+        Opened with a single-use ticket. The first frame is `hello`.
+        Personal events (`x-audience: player`) are filtered to your
+        connection by the server.
+      bindings:
+        websocket:
+          method: GET
+          query:
+            ticket:
+              type: string
+              description: >-
+                Single-use WebSocket ticket from POST /ws/ticket.
+                Valid 60 seconds. One connection per ticket.
+          headers:
+            Sec-WebSocket-Protocol:
+              type: string
+              description: Not used; reserved.
+      message:
+        oneOf:
+          - $ref: "#/components/messages/Hello"
+          - $ref: "#/components/messages/Heartbeat"
+          - $ref: "#/components/messages/PhaseChanged"
+          - $ref: "#/components/messages/PlayerPresence"
+          - $ref: "#/components/messages/AuthorProgress"
+          - $ref: "#/components/messages/DripRevealed"
+          - $ref: "#/components/messages/CardCapped"
+          - $ref: "#/components/messages/LockConfirmed"
+          - $ref: "#/components/messages/GuessProgress"
+          - $ref: "#/components/messages/SlideChanged"
+          - $ref: "#/components/messages/VoteProgress"
+          - $ref: "#/components/messages/VotekickStarted"
+          - $ref: "#/components/messages/VotekickProgress"
+          - $ref: "#/components/messages/VotekickResolved"
+          - $ref: "#/components/messages/GameOver"
+          - $ref: "#/components/messages/ReplayStarted"
+          - $ref: "#/components/messages/RoomClosed"
+          - $ref: "#/components/messages/ErrorEvent"
+
+components:
+  securitySchemes:
+    wsTicket:
+      type: httpApiKey
+      in: query
+      name: ticket
+      description: >-
+        Short-lived, single-use connection ticket minted by the
+        authenticated REST endpoint POST /ws/ticket. Deliberately NOT the
+        long-lived session token, which must never appear in a URL.
+
+  schemas:
+    EventEnvelope:
+      type: object
+      description: >-
+        Fields present on every server event. `seq` is room-scoped,
+        strictly monotonic, and shared by room- and player-audience
+        events so ordering is unambiguous. `at` is always a SERVER
+        timestamp; client clocks are irrelevant.
+      required: [seq, at]
+      properties:
+        seq:
+          type: integer
+          description: Room-scoped monotonic sequence number.
+        at:
+          type: string
+          format: date-time
+          description: Server timestamp.
+
+    Phase:
+      type: string
+      enum: [LOBBY, AUTHOR, GUESS, REVEAL, VOTE, FINAL, CLOSED]
+
+    PhaseContext:
+      description: >-
+        Phase-specific payload. Lets a reconnecting or mid-conversation
+        client render the phase without a snapshot in the common case.
+      anyOf:
+        - type: object
+          description: LOBBY context.
+          properties:
+            playerCount: { type: integer }
+            canStart: { type: boolean }
+        - type: object
+          description: AUTHOR context (drives the waiting-for-authors bar).
+          required: [cardsTotal]
+          properties:
+            cardsTotal: { type: integer }
+        - type: object
+          description: GUESS context. Counts only; never values.
+          required: [cardsTotal]
+          properties:
+            cardsTotal: { type: integer }
+        - type: object
+          description: REVEAL context.
+          required: [slideCount]
+          additionalProperties: false
+          properties:
+            slideCount: { type: integer }
+            autoAdvanceAt: { type: string, format: date-time }
+        - type: object
+          description: VOTE context.
+          required: [optionsCount, deadlineAt]
+          properties:
+            optionsCount:
+              type: integer
+              description: >-
+                Cards eligible for THIS player's vote (own card
+                excluded). Fetch option details via REST.
+            deadlineAt: { type: string, format: date-time }
+        - type: object
+          description: FINAL context (fetch scoreboard via REST).
+
+    Presence:
+      type: string
+      enum: [JOINED, LEFT, REJOINED, KICKED]
+
+    DripStage:
+      type: string
+      enum: [BULLETS_5S, RATING_10S]
+      description: Which drip stage just unlocked for the recipient.
+
+    CapCause:
+      type: string
+      enum: [CAP_20S, DISCONNECT, PHASE_END]
+      description: >-
+        CAP_20S - the card's 20s hard cap elapsed.
+        DISCONNECT - player was gone at cap; server auto-locked.
+        PHASE_END - game advanced (early end) while card was open.
+
+    CapResult:
+      type: string
+      enum: [AUTO_LOCKED, SCORED_ZERO]
+      description: >-
+        AUTO_LOCKED - slider had been touched; the server-side draft
+        value was locked. SCORED_ZERO - slider untouched; no lock, zero.
+
+    GameOverReason:
+      type: string
+      enum: [COMPLETED, TOO_FEW_PLAYERS, ABANDONED]
+      description: >-
+        TOO_FEW_PLAYERS - a votekick dropped the room under 4 players.
+        The final result (retrievable via REST) includes the cards
+        completed so far.
+
+  messages:
+    Hello:
+      name: hello
+      title: Connection acknowledgment (always the first frame)
+      x-audience: player
+      description: >-
+        Sent within 1s of connect. If `resync.required` is true, the
+        client MUST fetch the REST snapshot before rendering; the stream
+        alone cannot reconstruct missed state.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, roomCode, playerId, phase, resync]
+            properties:
+              type: { const: hello }
+              roomCode:
+                type: string
+                pattern: "^[A-Z0-9]{4}$"
+              playerId: { type: string, format: uuid }
+              phase: { $ref: "#/components/schemas/Phase" }
+              resync:
+                type: object
+                required: [required, snapshotUrl]
+                properties:
+                  required:
+                    type: boolean
+                    description: >-
+                      True when the client's last known seq (if any) is
+                      behind the seq in this hello.
+                  snapshotUrl:
+                    type: string
+                    format: uri
+                    description: GET /games/current/snapshot for this player.
+      examples:
+        - payload:
+            type: hello
+            seq: 118
+            at: "2026-10-11T21:04:02.113Z"
+            roomCode: "7KQ2"
+            playerId: "c9a1c0f2-38d1-4c5f-9f0a-1b2c3d4e5f60"
+            phase: GUESS
+            resync:
+              required: false
+              snapshotUrl: "https://api.impulsebuy.example/v1/games/current/snapshot"
+
+    Heartbeat:
+      name: heartbeat
+      title: Server heartbeat
+      x-audience: room
+      description: >-
+        Every 15s. Carries server time and consumes a seq (so silence
+        is detectable as a seq gap as well as a socket-level timeout).
+        The server drops connections that fail to pong within 30s.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, serverTime]
+            properties:
+              type: { const: heartbeat }
+              serverTime: { type: string, format: date-time }
+
+    PhaseChanged:
+      name: phase_changed
+      title: Phase transition
+      x-audience: room
+      description: >-
+        The server's single source of truth for phase transitions, with
+        the phase deadline and enough context to render the new screen.
+        On receipt, a client unsure of its state should fetch the
+        snapshot rather than infer.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, phase]
+            properties:
+              type: { const: phase_changed }
+              phase: { $ref: "#/components/schemas/Phase" }
+              deadlineAt:
+                type: [string, "null"]
+                format: date-time
+                description: >-
+                  Server deadline for the phase (60s author, vote
+                  deadline, etc.). Null when none (LOBBY, FINAL).
+              context: { $ref: "#/components/schemas/PhaseContext" }
+      examples:
+        - payload:
+            type: phase_changed
+            seq: 142
+            at: "2026-10-11T21:05:31.000Z"
+            phase: REVEAL
+            deadlineAt: "2026-10-11T21:05:43.000Z"
+            context:
+              cardsTotal: 5
+              slideCount: 5
+              autoAdvanceAt: "2026-10-11T21:05:43.000Z"
+
+    PlayerPresence:
+      name: player_presence
+      title: Player joined / left / rejoined / kicked
+      x-audience: room
+      description: >-
+        LEFT carries `rejoinGraceUntil` so waiting screens can show
+        whether the game is blocked on a grace period (it never blocks
+        past it).
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, presence, playerId, name]
+            properties:
+              type: { const: player_presence }
+              presence: { $ref: "#/components/schemas/Presence" }
+              playerId: { type: string, format: uuid }
+              name: { type: string }
+              rejoinGraceUntil:
+                type: [string, "null"]
+                format: date-time
+                description: Present only when presence is LEFT.
+              kickReason:
+                type: [string, "null"]
+                enum: [OFFENSIVE_CONTENT, AFK, null]
+                description: Present only when presence is KICKED.
+
+    AuthorProgress:
+      name: author_progress
+      title: Authoring progress (waiting-for-authors screen)
+      x-audience: room
+      description: >-
+        Coalesced to at most one event per 500ms. `skipped` counts
+        timeout/disconnect skips. `allDone` is followed by phase_changed.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, submitted, skipped, total, allDone]
+            properties:
+              type: { const: author_progress }
+              submitted: { type: integer }
+              skipped: { type: integer }
+              total: { type: integer }
+              allDone: { type: boolean }
+
+    DripRevealed:
+      name: drip_revealed
+      title: A drip stage unlocked on your active card
+      x-audience: player
+      description: >-
+        Sent ONLY to the player whose active card just crossed the 5s or
+        10s mark. Triggers the pulse + sound. The drip payload itself
+        (bullets, rating) is fetched via GET on the card or included in
+        the next snapshot; this event is the notification.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, cardId, stage]
+            properties:
+              type: { const: drip_revealed }
+              cardId: { type: string, format: uuid }
+              stage: { $ref: "#/components/schemas/DripStage" }
+      examples:
+        - payload:
+            type: drip_revealed
+            seq: 87
+            at: "2026-10-11T21:04:07.000Z"
+            cardId: "3f8b1d9e-6c24-4a1b-8e7d-2c5a9b0d4e11"
+            stage: BULLETS_5S
+
+    CardCapped:
+      name: card_capped
+      title: Active card ended without an explicit lock
+      x-audience: player
+      description: >-
+        Fired at the 20s cap, on disconnect at cap, or when the game
+        advances past an open card. If AUTO_LOCKED, `valueCents` is the
+        server-side draft the server locked — visible so a rejoining
+        player can see what happened. If SCORED_ZERO, no value is sent
+        (there is none).
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, cardId, cause, result]
+            properties:
+              type: { const: card_capped }
+              cardId: { type: string, format: uuid }
+              cause: { $ref: "#/components/schemas/CapCause" }
+              result: { $ref: "#/components/schemas/CapResult" }
+              valueCents:
+                type: integer
+                description: Present only when result is AUTO_LOCKED.
+              formattedValue:
+                type: string
+                description: Present only when result is AUTO_LOCKED.
+              nextCardId:
+                type: [string, "null"]
+                format: uuid
+                description: Null when the queue is done.
+
+    LockConfirmed:
+      name: lock_confirmed
+      title: Lock acknowledgment (your guess only)
+      x-audience: player
+      description: >-
+        Socket-level ack of the REST lock (drives haptic/visual
+        confirmation). Carries the SERVER-stamped time and the echoed
+        formatted value. Deliberately carries NO points — points exist
+        only in the final scoreboard.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, cardId, formattedValue, lockedAt]
+            properties:
+              type: { const: lock_confirmed }
+              cardId: { type: string, format: uuid }
+              formattedValue: { type: string }
+              lockedAt: { type: string, format: date-time }
+              nextCardId:
+                type: [string, "null"]
+                format: uuid
+                description: Null when the queue is done.
+      examples:
+        - payload:
+            type: lock_confirmed
+            seq: 95
+            at: "2026-10-11T21:04:14.227Z"
+            cardId: "3f8b1d9e-6c24-4a1b-8e7d-2c5a9b0d4e11"
+            formattedValue: "$127.50"
+            lockedAt: "2026-10-11T21:04:14.220Z"
+            nextCardId: "a02c77f1-90b3-45e6-b1c4-7d8e9f0a1b2c"
+
+    GuessProgress:
+      name: guess_progress
+      title: Your guessing progress and the room's completion
+      x-audience: player
+      description: >-
+        Counts ONLY. Never guess values, never other players' card
+        positions (order is per-player). Drives the "3 of 5 locked"
+        indicator and the waiting-for-guessers screen. `allPlayersDone`
+        is followed by phase_changed to REVEAL.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, myLocked, myTimedOut, myTotal, allPlayersDone]
+            properties:
+              type: { const: guess_progress }
+              myLocked: { type: integer }
+              myTimedOut:
+                type: integer
+                description: Capped / disconnect-zeroed cards.
+              myTotal: { type: integer }
+              allPlayersDone: { type: boolean }
+
+    SlideChanged:
+      name: slide_changed
+      title: Reveal carousel advanced
+      x-audience: room
+      description: >-
+        Shared slide index for all connections. Fetch slide content via
+        GET /games/current/reveal. `canAdvance` is computed per
+        recipient (true only for the creator).
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, slideIndex, slideCount, autoAdvanceAt]
+            properties:
+              type: { const: slide_changed }
+              slideIndex: { type: integer }
+              slideCount: { type: integer }
+              autoAdvanceAt: { type: string, format: date-time }
+              isLast: { type: boolean }
+              canAdvance:
+                type: boolean
+                description: True only on the room creator's connection.
+
+    VoteProgress:
+      name: vote_progress
+      title: Vote participation (never tallies)
+      x-audience: room
+      description: >-
+        How many of the eligible voters have voted — nothing about
+        which card is leading. Individual votes stay hidden until FINAL.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+          - type: object
+            required: [type, votesCast, totalVoters, deadlineAt]
+            properties:
+              type: { const: vote_progress }
+              votesCast: { type: integer }
+              totalVoters: { type: integer }
+              deadlineAt: { type: string, format: date-time }
+              allVoted: { type: boolean }
+
+    VotekickStarted:
+      name: votekick_started
+      title: A votekick was initiated
+      x-audience: room
+      description: >-
+        Only one active votekick at a time; votes are cast via REST
+        (POST /rooms/{roomCode}/votekick). Required votes =
+        ceil(2/3 of OTHER players). The target player receives this
+        event too — votekicks are not secret.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required:
+              [
+                type,
+                targetPlayerId,
+                targetName,
+                reason,
+                requiredVotes,
+                votesCast,
+                expiresAt,
+              ]
+            properties:
+              type: { const: votekick_started }
+              targetPlayerId: { type: string, format: uuid }
+              targetName: { type: string }
+              reason:
+                type: string
+                enum: [OFFENSIVE_CONTENT, AFK]
+              requiredVotes: { type: integer }
+              votesCast: { type: integer }
+              expiresAt: { type: string, format: date-time }
+
+    VotekickProgress:
+      name: votekick_progress
+      title: A votekick vote was cast (deduplicated)
+      x-audience: room
+      description: >-
+        One vote per player per votekick; duplicate REST calls are
+        ignored (idempotent) and do not emit events. Changing target
+        mid-vote is not permitted — the active votekick must resolve or
+        expire first.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, targetPlayerId, votesCast, requiredVotes]
+            properties:
+              type: { const: votekick_progress }
+              targetPlayerId: { type: string, format: uuid }
+              votesCast: { type: integer }
+              requiredVotes: { type: integer }
+
+    VotekickResolved:
+      name: votekick_resolved
+      title: Votekick outcome
+      x-audience: room
+      description: >-
+        KICKED is followed by a player_presence(KICKED) event; if the
+        room drops below 4 players, a game_over(TOO_FEW_PLAYERS) event
+        follows and the room moves to FINAL with the cards completed so
+        far. EXPIRED - deadline passed without threshold. CANCELLED -
+        target disconnected and left before resolution (no kick; the
+        disconnect rules apply instead).
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, targetPlayerId, outcome]
+            properties:
+              type: { const: votekick_resolved }
+              targetPlayerId: { type: string, format: uuid }
+              outcome:
+                type: string
+                enum: [KICKED, EXPIRED, CANCELLED]
+
+    GameOver:
+      name: game_over
+      title: Game ended (normally or early)
+      x-audience: room
+      description: >-
+        Followed by phase_changed to FINAL. For TOO_FEW_PLAYERS,
+        `completedCards` says how many slides the final result contains;
+        fetch the final scoreboard (rankings plus completed cards) via
+        REST. For early end during AUTHOR/GUESS, in-flight cards are
+        closed per the disconnect/cap rules.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, reason]
+            properties:
+              type: { const: game_over }
+              reason: { $ref: "#/components/schemas/GameOverReason" }
+              completedCards:
+                type: [integer, "null"]
+                description: Present only when reason is TOO_FEW_PLAYERS.
+
+    ReplayStarted:
+      name: replay_started
+      title: Replay created a new room
+      x-audience: room
+      description: >-
+        REPLAY SEMANTICS (one model, stated once): replay always
+        creates a NEW room linked to the old one via replayOfRoomId.
+        The old room's records and scores are immutable history. This
+        socket closes with 4411 after this event. Each player claims
+        their seat in the new room by calling the join endpoint with
+        their EXISTING session token inside the claim window; the
+        server maps old-token to new seat, so no new credentials are
+        issued and no other player's token ever crosses this stream.
+        Unclaimed seats expire with the window.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, newRoomCode, newRoomId, seatClaimExpiresAt]
+            properties:
+              type: { const: replay_started }
+              newRoomCode:
+                type: string
+                pattern: "^[A-Z0-9]{4}$"
+              newRoomId: { type: string, format: uuid }
+              seatClaimExpiresAt: { type: string, format: date-time }
+      examples:
+        - payload:
+            type: replay_started
+            seq: 210
+            at: "2026-10-11T21:11:58.000Z"
+            newRoomCode: "9FM4"
+            newRoomId: "6d1f1a9b-9c2e-4f0d-8a7b-3e4f5a6b7c8d"
+            seatClaimExpiresAt: "2026-10-11T21:12:58.000Z"
+
+    RoomClosed:
+      name: room_closed
+      title: Room closed (TTL or abandonment)
+      x-audience: room
+      description: Final event; the server then closes with code 1000.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, reason]
+            properties:
+              type: { const: room_closed }
+              reason:
+                type: string
+                enum: [TTL_EXPIRED, ABANDONED]
+
+    ErrorEvent:
+      name: error
+      title: Stream-level error (often followed by a close)
+      x-audience: player
+      description: >-
+        STREAM-level errors only (input validation errors belong to the
+        REST responses). Never contains game state or secrets.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            required: [type, code, message]
+            properties:
+              type: { const: error }
+              code:
+                type: string
+                enum: [CLIENT_FRAME_REJECTED, RATE_LIMITED, STALLED]
+              message: { type: string }
+              willClose:
+                type: boolean
+                description: >-
+                  True when the server will close the connection (with
+                  one of the documented close codes) after this event.

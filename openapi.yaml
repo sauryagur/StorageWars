@@ -1,29 +1,51 @@
 openapi: 3.1.0
 info:
   title: Impulse Buy API
-  version: 1.0.0
+  version: 2.0.0
   summary: Server-authoritative party game API for Impulse Buy
   description: |
     Mobile-first multiplayer party game: players author a product card
     from an image, then guess each other's prices.
 
-    Invariants enforced by this API:
+    Invariants enforced by this contract:
 
     1. **Server authority.** Clients send inputs only. The server owns
        phase transitions, timers, drip schedules, lock timestamps,
-       scoring, and vote tallies.
-    2. **Secrets stay server-side.** `price_cents`, `original_title`,
-       `original_description`, and the product image are never present
-       in any response consumed before the REVEAL phase. There is no
-       field in any guesser-facing schema that could carry them.
-       The image URL is issued only to the card's author.
+       scoring, and vote tallies. All timestamps in responses are
+       server-stamped; client clocks are never trusted.
+    2. **Secrets stay server-side.** `priceCents`, `originalTitle`,
+       `originalDescription`, and the product image are never present
+       in any response consumed before the REVEAL phase — including
+       error payloads. Guesser-facing schemas have no fields that
+       could carry them. The image URL is issued only to the card's
+       author, scoped to the AUTHOR phase window.
     3. **Scores are hidden until FINAL.** No running totals anywhere.
-    4. **Guesses are hidden until REVEAL.** Progress counts only,
-       never values.
-    5. **All prices are integer cents** (slider: $1-$1000, cents
-       permitted under $20, i.e. value_cents in [100, 100000]).
+    4. **Guess values are hidden until REVEAL.** Progress is counts
+       only, never values.
+    5. **All money is integer cents.** Slider range $1–$1000, i.e.
+       valueCents in [100, 100000]. Numeric out-of-range input is
+       CLAMPED and echoed; only non-numeric input is rejected (422).
+       At or above $20.00 the server rounds to the nearest whole
+       dollar; below $20.00 cents are preserved. Clamped and rounded
+       values are what is stored, displayed, and scored.
+    6. **Card lifecycle:** `ASSIGNED -> SUBMITTED | SKIPPED`. Skipped
+       cards (timeout / disconnect) are excluded from the guess queue,
+       reveal carousel, vote options, and author scoring. All totals
+       count SUBMITTED cards only.
+    7. **Token-room binding.** Every authenticated endpoint under
+       /rooms/{roomCode} or /games requires the session token to
+       resolve to a seat in THAT room, else 403 WRONG_ROOM.
+
+    Realtime events (push-only WebSocket) are specified in the
+    companion AsyncAPI document. Gameplay inputs go through REST.
+
+    Room codes (4 chars, ~1.7M possibilities) are a convenience
+    identifier, NOT a security boundary. Join attempts are
+    rate-limited per IP and per failed room code.
+
   license:
     name: Proprietary
+    identifier: LicenseRef-Proprietary
 
 servers:
   - url: https://api.impulsebuy.example/v1
@@ -34,17 +56,16 @@ security:
 
 tags:
   - name: Rooms
+  - name: Session
   - name: Author
   - name: Guess
   - name: Reveal
   - name: Vote & Final
-  - name: Realtime
   - name: Moderation
   - name: Admin
   - name: System
 
 paths:
-
   /health:
     get:
       tags: [System]
@@ -59,17 +80,14 @@ paths:
                 type: object
                 required: [status]
                 properties:
-                  status: { type: string, const: "ok" }
+                  status: { type: string, const: ok }
 
   # ---------------------------------------------------------------- Rooms
+
   /rooms:
     post:
       tags: [Rooms]
-      summary: Create a room
-      description: Creates a private room with a unique 4-character code
-        and returns a session token. The creator must still join via
-        `POST /rooms/{roomCode}/join` semantics — this call both creates
-        the room and joins the caller as creator.
+      summary: Create a room and join as creator
       security: []
       requestBody:
         required: true
@@ -79,21 +97,37 @@ paths:
               type: object
               required: [name]
               properties:
-                name:
-                  $ref: "#/components/schemas/DisplayName"
+                name: { $ref: "#/components/schemas/DisplayName" }
       responses:
         "201":
           description: Room created; caller joined as creator.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/JoinResponse" }
-        "422":
-          $ref: "#/components/responses/ValidationError"
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
 
   /rooms/{roomCode}/join:
     post:
       tags: [Rooms]
-      summary: Join a room
+      summary: Join a room, or rejoin an existing seat
+      description: |
+        Two distinct operations, discriminated by the request body:
+
+        * **New join:** requires `name`. Creates a new seat and a new
+          session token. Returns 409 if the game is in progress, the
+          room is full, or the name is taken.
+        * **Rejoin:** requires `sessionToken` (an existing token from
+          this room). Resolves the existing seat BEFORE any new-join
+          prohibition applies — so rejoining during AUTHOR or GUESS is
+          explicitly permitted. `name` is optional and ignored.
+          Returns the same session token, plus the current phase so
+          the client can fetch a snapshot. Rejoin is permitted in
+          LOBBY, AUTHOR, GUESS, REVEAL, and VOTE; in FINAL the token
+          resolves but the room is read-only.
+
+        A failed room code is throttled per IP (429) to blunt
+        enumeration of the 4-character code space.
       security: []
       parameters:
         - $ref: "#/components/parameters/RoomCode"
@@ -102,42 +136,39 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [name]
-              properties:
-                name:
-                  $ref: "#/components/schemas/DisplayName"
-                # Rejoin: pass the previously issued token instead of a
-                # new identity.
-                sessionToken:
-                  type: string
-                  description: |
-                    Existing session token for rejoin after disconnect.
-                    If present and valid, `name` is ignored and the
-                    player's seat is restored.
+              oneOf:
+                - $ref: "#/components/schemas/JoinRequest"
+                - $ref: "#/components/schemas/RejoinRequest"
       responses:
         "200":
-          description: |
-            Joined. `rejoined=true` when restored from a session token.
+          description: Joined or rejoined.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/JoinResponse" }
         "404": { $ref: "#/components/responses/RoomNotFound" }
         "409":
-          description: Room full (8 players) or game already in progress.
+          description: |
+            New join blocked: game in progress, room full (8), or name
+            taken. Rejoin requests never receive GAME_IN_PROGRESS.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "410":
+          description: Rejoin token expired or seat reclaimed (grace
+            period elapsed, or the room closed).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
 
   /rooms/{roomCode}:
     get:
       tags: [Rooms]
       summary: Room / lobby state
       description: |
-        Current phase and player list. Safe to poll; realtime updates
-        arrive on the WebSocket. Never contains any game secrets or
-        scores.
+        Current phase and player list. The session token must belong
+        to a seat in this room. Never contains game secrets or scores.
       parameters:
         - $ref: "#/components/parameters/RoomCode"
       responses:
@@ -146,6 +177,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/RoomState" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/RoomNotFound" }
 
   /rooms/{roomCode}/start:
@@ -153,14 +185,15 @@ paths:
       tags: [Rooms]
       summary: Start the game (creator only)
       description: |
-        Samples N distinct products (log-uniform by price, no repeats
-        within the game) and moves the room to AUTHOR with a 60-second
-        server timer.
+        Samples N distinct products — log-uniform by price, sampled
+        WITHOUT replacement within the game, one per player — and moves
+        the room to AUTHOR with a 60-second server timer. The
+        (room, product) uniqueness invariant is enforced server-side.
       parameters:
         - $ref: "#/components/parameters/RoomCode"
       responses:
         "202":
-          description: Game started; room moved to AUTHOR.
+          description: Game started; room in AUTHOR.
           content:
             application/json:
               schema:
@@ -169,60 +202,119 @@ paths:
                 properties:
                   phase: { $ref: "#/components/schemas/Phase" }
                   authorDeadlineAt: { type: string, format: date-time }
-        "403":
-          description: Caller is not the room creator.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "409":
-          description: Fewer than 4 players, or game already in progress.
+          description: Fewer than 4 players, or game in progress.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
   /rooms/{roomCode}/replay:
     post:
-    # NOTE: YAML indented below
       tags: [Vote & Final]
-      summary: Return everyone to the lobby (creator only)
+      summary: Create a replay room (creator only, FINAL phase only)
       description: |
-        Only valid in FINAL. Server resamples products; the new room
-        links `replayOfRoomId` for the replay-rate metric.
+        REPLAY SEMANTICS (single model): replay always creates a NEW
+        room linked to the old one via replayOfRoomId. The old room,
+        its records, and its scores are immutable history. The creator
+        receives the new room code and a seat-claim window. Every
+        player (including the creator) claims a seat in the new room
+        by calling join with their EXISTING session token inside the
+        window; the server maps old token to new seat, so no new
+        credentials are issued and no player ever receives another
+        player's token. Unclaimed seats expire with the window.
       parameters:
         - $ref: "#/components/parameters/RoomCode"
       responses:
-        "202":
-          description: Room reset to LOBBY.
+        "201":
+          description: New room created; seat claim window opened.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReplayResponse" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "409":
           description: Not in FINAL phase.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # --------------------------------------------------------------- Session
+
+  /ws/ticket:
+    post:
+      tags: [Session]
+      summary: Mint a single-use WebSocket ticket
+      description: |
+        Exchanges the long-lived session token (header) for a
+        short-lived, single-use connection ticket for the AsyncAPI
+        WebSocket. The session token itself never appears in a URL or
+        query string. Tickets expire in 60 seconds and open exactly
+        one connection.
+      responses:
+        "201":
+          description: Ticket minted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WsTicket" }
+        "429":
+          description: Ticket minting rate-limited (per session).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /games/current/snapshot:
+    get:
+      tags: [Session]
+      summary: Authoritative per-player state snapshot
+      description: |
+        THE recovery contract for reconnects and mid-game rejoins.
+        Returns the absolute, per-phase, per-player redacted state:
+        phase and deadlines, queue position and per-card statuses,
+        the active card with its drip-redacted fields, the server-side
+        draft value, lock states, current reveal slide index, and vote
+        options. Redaction rules are identical to the per-resource
+        GET endpoints. The client refetches this after any reconnect
+        where it may have missed events; the WebSocket stream is a
+        live view, this is the truth.
+      responses:
+        "200":
+          description: Snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GameSnapshot" }
+        "409": { $ref: "#/components/responses/PhaseError" }
 
   # --------------------------------------------------------------- Author
+
   /games/current/author-card:
     get:
       tags: [Author]
       summary: Get my card to author
       description: |
-        Returns ONLY the product image and the coarse price band
-        (never title, description, or exact price) plus the form
-        constraints. Available in AUTHOR phase.
+        Returns ONLY the product image and the coarse price band —
+        never title, description, exact price, or review data. The
+        image URL is signed and scoped to this player and the AUTHOR
+        phase window.
       responses:
         "200":
-          description: |
-            Author card view. The image URL is signed and scoped to
-            this player and the AUTHOR phase window only.
+          description: Author card view.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/AuthorCardView" }
         "409": { $ref: "#/components/responses/PhaseError" }
     put:
       tags: [Author]
-      summary: Submit my authored card
+      summary: Submit my authored card (full or partial)
       description: |
-        Server-side validation: length rules, digit/number-word/
-        currency-symbol/price-word rejection, profanity filter.
-        Submitting nothing before the 60s timeout skips the card;
-        a partial submit keeps filled fields and blanks the rest —
-        i.e. omitted fields are legal and stored as null.
+        Server-side validation: length rules, digit / number-word /
+        currency-symbol / price-word rejection, profanity filter.
+        Fields are individually optional to support the PRD's partial
+        submission rule: filled fields are stored, the rest remain
+        blank (null). An author who submits nothing before the 60s
+        timeout is marked SKIPPED — that card is excluded from the
+        queue, carousel, and votes, and scores no author points.
+        Repeated PUTs before the deadline overwrite the stored card
+        (last write wins); after the deadline the card is final.
       requestBody:
         required: true
         content:
@@ -230,55 +322,106 @@ paths:
             schema: { $ref: "#/components/schemas/AuthorCardSubmission" }
       responses:
         "200":
-          description: |
-            Card accepted (fully or partially). Response echoes the
-            stored card.
+          description: Card stored (fully or partially).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/AuthorCardStored" }
         "409": { $ref: "#/components/responses/PhaseError" }
         "422":
           description: |
-            Validation failure. `errors` is field-level for live
-            inline display (which rule, which field, which word).
+            Validation failure. `fieldErrors` is field-level for live
+            inline display; each entry names the rule and, for
+            word-list rules, the offending word.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/AuthorValidationError" }
 
   # ---------------------------------------------------------------- Guess
+
   /games/current/guess/queue:
     get:
       tags: [Guess]
       summary: My shuffled card queue
       description: |
-        Card order is shuffled PER PLAYER so card positions reveal
-        nothing on voice chat. Returns stubs only — content arrives
-        via the card endpoint on the server drip schedule.
+        Card order is shuffled PER PLAYER, so card positions reveal
+        nothing on voice chat. Only SUBMITTED cards appear; skipped
+        cards are excluded and not counted in totals. Exposes card IDs
+        and statuses only — content access is governed by the
+        server-side one-active-card state machine on the open
+        endpoint, regardless of what IDs a client holds.
       responses:
         "200":
-          description: Queue stubs plus overall progress.
+          description: Queue stubs plus progress counts.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/GuessQueue" }
         "409": { $ref: "#/components/responses/PhaseError" }
 
+  /games/current/guess/cards/{cardId}/open:
+    post:
+      tags: [Guess]
+      summary: Open the next card (starts its drip schedule)
+      description: |
+        THE queue state machine, server-enforced:
+
+        * Exactly ONE active card per player at any time.
+        * Only the player's NEXT eligible card may be opened. Opening
+          a future card, a locked card, an already-open card, or a
+          card not in this player's queue is rejected (409/404).
+        * Opening a card starts its drip timers ONCE; retries can
+          never reset or extend them.
+        * A locked card cannot be reopened or modified.
+        * The server, not the client, determines queue position and
+          whether a lock advances it.
+
+        This is a POST because it changes state; the GET on the card
+        is read-only and always returns the current representation.
+      parameters:
+        - $ref: "#/components/parameters/CardId"
+      responses:
+        "200":
+          description: Card opened; returns the 0s-drip representation.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GuessCardView" }
+        "404":
+          description: Card not in this player's queue.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: |
+            Not the next eligible card, another card is active, the
+            card is locked, or wrong phase. The error carries the
+            client's authoritative queue position so it can recover.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: Open attempts rate-limited (anti-fuzzing).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /games/current/guess/cards/{cardId}:
     get:
       tags: [Guess]
-      summary: Open a card (drip-redacted)
+      summary: Read my active card (drip-redacted, read-only)
       description: |
-        The card's information arrives on a server-driven schedule
-        relative to `openedAt` (set by the server when the player
-        first opens this card):
+        Read-only. NEVER starts or resets timers — only `open` does.
+        The card's information is determined by the server clock
+        relative to the server-recorded `openedAt`:
 
         * 0s — title, category
-        * 5s — three bullet points
+        * 5s — bullet slots
         * 10s — star rating, review-count bucket
-        * 20s — hard cap; latest slider position auto-locks
+        * 20s — hard cap; latest draft value auto-locks
 
-        Fields whose drip stage has not elapsed are ABSENT from the
-        response (not null, not empty). There is no image, original
-        title, original description, or price in this schema at all.
+        ABSENT field = drip stage not reached. `null` = the stage is
+        reached but the author left the field blank. Distinct
+        meanings, never conflated. This schema structurally cannot
+        carry the image, original title, original description, or
+        price.
       parameters:
         - $ref: "#/components/parameters/CardId"
       responses:
@@ -294,71 +437,130 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "409": { $ref: "#/components/responses/PhaseError" }
 
-  /games/current/guess/cards/{cardId}/touch:
-    post:
+  /games/current/guess/cards/{cardId}/draft:
+    put:
       tags: [Guess]
-      summary: Report slider touched (enables Lock)
+      summary: Update the server-side draft value (the slider position)
       description: |
-        Lock is disabled until the slider has been touched and 3
-        seconds of minimum dwell have elapsed. The server records the
-        touch; this also covers the disconnect rule (auto-lock only
-        applies if the slider was touched).
-      parameters:
-        - $ref: "#/components/parameters/CardId"
-      responses:
-        "204": { description: Touch recorded. }
-        "409": { $ref: "#/components/responses/PhaseError" }
-
-  /games/current/guess/cards/{cardId}/lock:
-    post:
-      tags: [Guess]
-      summary: Lock my guess
-      description: |
-        Commits the guess permanently and advances to the next card.
-        The lock timestamp is stamped by the SERVER. The live
-        multiplier is `M(t) = 1.0 - 0.3 * (t / 20)`, t clamped to
-        [0, 20]. Points are computed server-side but NEVER returned
-        before FINAL.
+        Keeps the latest slider position in authoritative server
+        state. THIS is what makes the disconnect auto-lock rule
+        implementable: a player who drafts $127.50, touches the
+        slider, and then loses their connection has their draft
+        auto-locked at the card's 20s cap. A player who never touched
+        the slider scores zero. Drafts are throttled server-side
+        (coalesced; only the latest value matters) and are NOT
+        persisted per-keystroke — the latest value is authoritative
+        and persisted at lock time or cap time. Numeric values are
+        clamped to [100, 100000] cents and rounded per the money
+        rule; the normalized value is echoed.
       parameters:
         - $ref: "#/components/parameters/CardId"
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/LockRequest" }
+            schema: { $ref: "#/components/schemas/ValueInput" }
       responses:
         "200":
-          description: |
-            Lock confirmed. The echoed formatted value is returned so
-            typos are visible before and after locking.
+          description: Draft accepted (and normalized).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ValueEcho" }
+        "404":
+          description: Card not in this player's queue.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Card is not the active card, already locked, or
+            wrong phase.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: Non-numeric / unparseable value.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /games/current/guess/cards/{cardId}/touch:
+    post:
+      tags: [Guess]
+      summary: Report slider touched (enables Lock)
+      description: |
+        Idempotent. Lock is disabled until the slider has been
+        touched AND 3 seconds of minimum dwell have elapsed since
+        open. Touch state also governs disconnect auto-lock
+        (auto-lock fires only if touched).
+      parameters:
+        - $ref: "#/components/parameters/CardId"
+      responses:
+        "204": { description: Touch recorded (idempotent). }
+        "409": { $ref: "#/components/responses/PhaseError" }
+
+  /games/current/guess/cards/{cardId}/lock:
+    post:
+      tags: [Guess]
+      summary: Lock my guess (permanent)
+      description: |
+        Commits the guess permanently and advances the queue. The
+        lock timestamp is stamped by the SERVER. The live multiplier
+        is M(t) = 1.0 - 0.3 * (t / 20), t = server-measured seconds on
+        the card, clamped to [0, 20]. Points are computed server-side
+        but NEVER returned before FINAL.
+
+        Value handling: numeric input is clamped to [100, 100000]
+        cents and rounded per the money rule ($20+ -> whole dollars);
+        the normalized value is echoed with `wasClamped`/`wasRounded`
+        flags so typos are visible. Non-numeric input is rejected
+        (422). Locking without a prior draft/touch is rejected (403
+        SLIDER_UNTOUCHED).
+      parameters:
+        - $ref: "#/components/parameters/CardId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ValueInput" }
+      responses:
+        "200":
+          description: Lock confirmed.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/LockResponse" }
         "403":
           description: |
-            Lock rejected — minimum dwell not met, slider untouched,
-            or card already locked.
+            Minimum dwell (3s) not met, slider untouched, or card
+            already locked.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Card not in this player's queue.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409": { $ref: "#/components/responses/PhaseError" }
         "422":
-          description: Value rejected (non-numeric, out of range,
-            unparseable). Values are clamped to [100, 100000] cents.
+          description: Non-numeric value.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
   # --------------------------------------------------------------- Reveal
+
   /games/current/reveal:
     get:
       tags: [Reveal]
       summary: Current reveal slide
       description: |
-        Shared carousel, one card per slide, shuffled order. This is
-        the ONLY pre-final context in which product secrets (image,
-        original title/description, true price) are released. Slides
-        advance automatically (~12s) or early by the creator. Scores
-        are not on slides.
+        Shared carousel over the SUBMITTED cards, shuffled order,
+        ~12s per slide, auto-advancing; the creator can advance
+        early. This is the only pre-FINAL context in which product
+        secrets (image, original title/description, true price) are
+        released. Slides carry NO points — scores appear only on the
+        final scoreboard (this resolves the PRD's internal
+        contradiction in favor of hidden scores).
       responses:
         "200":
           description: Current slide.
@@ -373,23 +575,43 @@ paths:
       summary: Advance the carousel early (creator only)
       responses:
         "202": { description: Advanced. }
-        "403":
-          description: Not the room creator.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/Error" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "409": { $ref: "#/components/responses/PhaseError" }
 
   # ---------------------------------------------------------- Vote & Final
+
+  /games/current/vote/options:
+    get:
+      tags: [Vote & Final]
+      summary: Cards eligible for my funniest-card vote
+      description: |
+        The canonical vote-phase representation: the SUBMITTED cards
+        excluding the voter's own, with the minimal presentation
+        needed to choose one. A rejoining client that missed slides
+        recovers its options from here (and from the snapshot).
+        Individual votes and tallies remain hidden until FINAL.
+        Voting ends when all eligible players have voted OR the vote
+        deadline (server-set, ~30s, tunable) expires; non-voters
+        simply record no vote and cost no one anything.
+      responses:
+        "200":
+          description: Vote options.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VoteOptions" }
+        "409": { $ref: "#/components/responses/PhaseError" }
+
   /games/current/vote:
     post:
       tags: [Vote & Final]
-      summary: Cast funniest-card vote
+      summary: Cast funniest-card vote (one, final)
       description: |
-        One hidden vote per player, for a card that is not the voter's
-        own. Votes are tallied server-side and never exposed
-        individually. Most votes wins +300 for the author, split on
-        ties.
+        One hidden vote per player, for a card that is not the
+        voter's own. The vote is FINAL when cast — it cannot be
+        replaced or withdrawn (409 ALREADY_VOTED). Most votes wins
+        +300 for the author, split on ties. Votes cast for a card
+        whose author is later kicked are discarded; the kicked
+        player's own vote is also discarded.
       requestBody:
         required: true
         content:
@@ -406,28 +628,46 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
-        "409": { $ref: "#/components/responses/PhaseError" }
+        "409":
+          description: Already voted, or wrong phase.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /games/current/final:
     get:
       tags: [Vote & Final]
-      summary: Final scoreboard (scores revealed only here)
+      # NOTE: summary/description continue below
+      summary: Final scoreboard
+      description: |
+        Ranked scoreboard with full breakdown. Also the result for
+        EARLY-ENDED games: `endedReason` is TOO_FEW_PLAYERS when a
+        votekick dropped the room under 4 players, and the response
+        includes only the cards completed by that point — the client
+        never has to infer how an interrupted phase resolves.
+        Author points use the mean accuracy over ALL eligible
+        guessers on the card (kicked players excluded; zero-accuracy
+        and timed-out guesses count as 0 in the denominator — never
+        a mean over locked guesses only).
       responses:
         "200":
-          description: Ranked scoreboard with full breakdown.
+          description: Final scoreboard.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/FinalScoreboard" }
         "409": { $ref: "#/components/responses/PhaseError" }
 
-  # --------------------------------------------------------------- Reports
+  # ------------------------------------------------------------- Moderation
+
   /reports:
     post:
       tags: [Moderation]
-      summary: Report a card or player
+      summary: Report a card or a player
       description: |
-        For offensive content or AFK only. Reports never carry game
-        secrets to moderators before the reveal.
+        For offensive content or AFK only. Exactly one of
+        reportedCardId / reportedPlayerId must be present, and the
+        target must belong to the reporter's room. Reports never
+        carry game secrets to moderators before the reveal.
       requestBody:
         required: true
         content:
@@ -440,14 +680,28 @@ paths:
   /rooms/{roomCode}/votekick:
     post:
       tags: [Moderation]
-      summary: Cast a votekick vote
+      summary: Cast a votekick vote (idempotent)
       description: |
-        Requires two-thirds of OTHER players. Valid reasons are
-        offensive content or AFK only — NOT cheating accusations.
-        A kicked player's cards and guesses are removed from totals;
-        scoring is prior-based so no recomputation of crowd stats is
-        needed. If fewer than 4 players remain, the game ends early
-        and shows completed cards.
+        Reasons are offensive content or AFK only — NOT cheating
+        accusations (per PRD). Semantics:
+
+        * Exactly one ACTIVE votekick per room; the active vote must
+          resolve or expire before a different target can be raised
+          (409 VOTEKICK_IN_PROGRESS).
+        * One vote per player per votekick. Duplicate calls are
+          idempotent: they return the current tally and emit no event.
+        * Threshold: ceil(2/3 of OTHER players), evaluated on each
+          new vote; the kick executes when reached.
+        * The votekick expires after 30s without reaching threshold.
+        * A kicked player's card and guesses are removed from
+          everyone's totals; their vote is discarded, and votes cast
+          for their card are discarded. Scoring is prior-based, so
+          removal requires no crowd recomputation.
+        * If fewer than 4 players remain, the game ends early:
+          phase moves to FINAL with endedReason TOO_FEW_PLAYERS and
+          the completed cards.
+        * If the target disconnects before resolution, the votekick
+          is CANCELLED (no kick; disconnect rules apply instead).
       parameters:
         - $ref: "#/components/parameters/RoomCode"
       requestBody:
@@ -463,41 +717,41 @@ paths:
                   type: string
                   enum: [OFFENSIVE_CONTENT, AFK]
       responses:
-        "202": { description: Vote recorded (kick executes when threshold met). }
-        "403":
-          description: Cannot kick yourself / reason not permitted.
+        "200":
+          description: |
+            Vote recorded or duplicate (idempotent). Returns the
+            current tally.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [votesCast, requiredVotes, resolved]
+                properties:
+                  votesCast: { type: integer }
+                  requiredVotes: { type: integer }
+                  resolved:
+                    type: boolean
+                    description: True when the kick executed.
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: |
+            Another votekick is active for a different target, or
+            wrong phase.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
-  # --------------------------------------------------------------- Realtime
-  /ws/{roomCode}:
-    get:
-      tags: [Realtime]
-      summary: Realtime event stream (WebSocket)
-      description: |
-        **This operation describes a WebSocket endpoint**, upgrade at
-        `wss://api.impulsebuy.example/v1/ws/{roomCode}?token={sessionToken}`.
-        One WebSocket per player. The socket is push-only: clients send
-        gameplay inputs via the REST endpoints above (server authority,
-        easy rate-limiting and clamping). Message schemas are defined
-        under `components.schemas.WsServerEvent`.
-      parameters:
-        - $ref: "#/components/parameters/RoomCode"
-        - name: token
-          in: query
-          required: true
-          schema: { type: string }
-          description: Session token from join.
-      responses:
-        "101":
-          description: Switching protocols.
+  # ---------------------------------------------------------------- Admin
+  # SECURITY: every /admin operation overrides the global scheme with
+  # the admin bearer scheme. A player session token can never satisfy
+  # it. Product secrets appear ONLY in these responses.
 
-  # ----------------------------------------------------------------- Admin
   /admin/products:
     get:
       tags: [Admin]
-      summary: List products
+      summary: List products (full secrets)
+      security:
+        - adminAuth: []
       parameters:
         - name: active
           in: query
@@ -510,15 +764,29 @@ paths:
           schema: { type: integer, minimum: 1, maximum: 4 }
       responses:
         "200":
-          description: Products (full secrets; admin only).
+          description: Products.
           content:
             application/json:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/ProductAdmin" }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
     post:
       tags: [Admin]
       summary: Create a product
+      security:
+        - adminAuth: []
+      description: |
+        Product images are imported and registered OUT OF BAND (the
+        ingestion pipeline re-encodes, strips metadata and filenames,
+        and writes the ProductImage row). This endpoint references an
+        already-registered image by `imageStorageKey`, whose format is
+        `products/{contentHash}.{webp|jpg}`. An unknown storage key is
+        rejected. `snapshotDate` is a calendar date (date, not
+        datetime) and matches the reveal copy ("snapshot price as
+        of …"). `priceBand` is derived server-side from priceCents
+        and is immutable — product price snapshots are immutable
+        after curation; corrections create a new product version.
       requestBody:
         required: true
         content:
@@ -526,19 +794,19 @@ paths:
             schema: { $ref: "#/components/schemas/ProductAdmin" }
       responses:
         "201":
-          description: Created. `priceBand` is derived server-side.
+          description: Created.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ProductAdmin" }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
         "422": { $ref: "#/components/responses/ValidationError" }
 
   /admin/categories/{slug}:
     patch:
       tags: [Admin]
-      summary: Tune a category's sigma
-      description: |
-        Adjusts the prior spread used in scoring normalization, from
-        playtest/simulation data.
+      summary: Tune a category (sigma)
+      security:
+        - adminAuth: []
       parameters:
         - name: slug
           in: path
@@ -555,21 +823,80 @@ paths:
                   type: number
                   minimum: 0.05
                   maximum: 3.0
-                  description: Default 0.5 (zero point ~2.7x off).
+                  description: Prior spread for scoring normalization.
                 active: { type: boolean }
       responses:
         "200": { description: Updated. }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+
+  /admin/reports:
+    get:
+      tags: [Admin]
+      summary: List reports for review
+      security:
+        - adminAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [OPEN, RESOLVED, DISMISSED]
+      responses:
+        "200":
+          description: Reports.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ReportAdmin" }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
+
+  /admin/reports/{reportId}:
+    patch:
+      tags: [Admin]
+      summary: Resolve or dismiss a report
+      security:
+        - adminAuth: []
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [RESOLVED, DISMISSED]
+                resolutionNote: { type: string, maxLength: 1000 }
+      responses:
+        "200": { description: Updated. }
+        "401": { $ref: "#/components/responses/AdminUnauthorized" }
 
 components:
-
   securitySchemes:
     sessionToken:
       type: apiKey
       in: header
       name: X-Session-Token
       description: |
-        Session token issued by room create/join. Authorizes exactly
-        one player seat in one room. No accounts.
+        Long-lived per-seat credential issued by create/join.
+        Authorizes exactly one player seat in exactly one room;
+        presenting it against any other room returns 403 WRONG_ROOM.
+        Never appears in URLs or query strings.
+    adminAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Separate administrative credential. Every /admin operation
+        explicitly requires THIS scheme (overriding the global player
+        scheme); a player session token must never satisfy it. A
+        player token presented as an admin bearer token fails 401.
 
   parameters:
     RoomCode:
@@ -581,7 +908,7 @@ components:
         minLength: 4
         maxLength: 4
         pattern: "^[A-Z0-9]{4}$"
-      description: 4-character room code.
+      description: 4-character room code (convenience ID, not a secret).
     CardId:
       name: cardId
       in: path
@@ -594,9 +921,15 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
-    PhaseError:
+    Forbidden:
       description: |
-        Operation not valid for the current phase.
+        Not the room creator, token not bound to this room
+        (WRONG_ROOM), or action forbidden for this seat.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    PhaseError:
+      description: Operation not valid for the current phase.
       content:
         application/json:
           schema:
@@ -605,6 +938,10 @@ components:
               - type: object
                 properties:
                   phase: { $ref: "#/components/schemas/Phase" }
+                  retryInPhase:
+                    type: [string, "null"]
+                    description: The phase in which this operation
+                      becomes valid, if any.
     ValidationError:
       description: Input validation failure.
       content:
@@ -631,15 +968,49 @@ components:
                             - CURRENCY_SYMBOL_REJECTED
                             - PRICE_WORD_REJECTED
                             - PROFANITY_REJECTED
-                            - BULLETS_COUNT
+                            - BULLET_COUNT
                             - STAR_RATING_STEP
+                            - CATEGORY_UNKNOWN
                             - OUT_OF_RANGE
+                            - EXACTLY_ONE_TARGET
+                            - IMAGE_KEY_UNKNOWN
+    RateLimited:
+      description: Rate-limited (join enumeration, ticket minting,
+        or input flood).
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    AdminUnauthorized:
+      description: |
+        Missing or invalid admin credential. Player session tokens
+        are never accepted on admin endpoints; the error body is
+        generic and reveals nothing about product data.
 
   schemas:
-
     Phase:
       type: string
       enum: [LOBBY, AUTHOR, GUESS, REVEAL, VOTE, FINAL, CLOSED]
+
+    CardStatus:
+      type: string
+      enum: [ASSIGNED, SUBMITTED, SKIPPED]
+      description: |
+        Author-side card lifecycle. SKIPPED (author timeout or
+        disconnect) cards are excluded from the queue, carousel,
+        votes, and author scoring; all totals count SUBMITTED only.
+
+    GuessStatus:
+      type: string
+      enum: [UNOPENED, IN_PROGRESS, LOCKED, TIMED_OUT, SKIPPED]
+      description: |
+        Guesser-side per-card lifecycle. TIMED_OUT = capped at 20s
+        (auto-locked draft if touched, else zero). SKIPPED = the
+        card's author was kicked or the game ended early before this
+        card was playable.
 
     DisplayName:
       type: string
@@ -650,6 +1021,9 @@ components:
     Error:
       type: object
       required: [code, message]
+      description: |
+        Error bodies are generic. They never contain product data,
+        other players' guesses, or scores.
       properties:
         code:
           type: string
@@ -658,22 +1032,51 @@ components:
             - ROOM_FULL
             - GAME_IN_PROGRESS
             - NAME_TAKEN
+            - REJOIN_EXPIRED
+            - WRONG_ROOM
             - NOT_CREATOR
             - WRONG_PHASE
             - NOT_IN_QUEUE
+            - NOT_NEXT_CARD
+            - CARD_ACTIVE
             - ALREADY_LOCKED
-            - LOCK_TOO_EARLY          # 3s minimum dwell not met
+            - ALREADY_OPENED
+            - ALREADY_VOTED
+            - LOCK_TOO_EARLY
             - SLIDER_UNTOUCHED
-            - OWN_CARD_FORBIDDEN      # vote
+            - OWN_CARD_FORBIDDEN
+            - VOTEKICK_IN_PROGRESS
             - KICK_TARGET_INVALID
-            - VALUE_REJECTED
+            - VALUE_NOT_NUMERIC
             - RATE_LIMITED
             - VALIDATION_FAILED
         message: { type: string }
 
+    # --------------------------------------------------------- Join / Room
+
+    JoinRequest:
+      type: object
+      required: [name]
+      description: New join.
+      properties:
+        name: { $ref: "#/components/schemas/DisplayName" }
+
+    RejoinRequest:
+      type: object
+      required: [sessionToken]
+      description: |
+        Rejoin with an existing seat token. Resolves the seat BEFORE
+        any new-join prohibition; permitted during AUTHOR, GUESS,
+        REVEAL, and VOTE. `name` is optional and ignored.
+      properties:
+        sessionToken:
+          type: string
+          description: The session token originally issued to this seat.
+        name: { $ref: "#/components/schemas/DisplayName" }
+
     JoinResponse:
       type: object
-      required: [roomId, roomCode, playerId, sessionToken, ttlExpiresAt]
+      required: [roomId, roomCode, playerId, sessionToken, phase, ttlExpiresAt]
       properties:
         roomId: { type: string, format: uuid }
         roomCode:
@@ -683,22 +1086,30 @@ components:
         sessionToken:
           type: string
           description: |
-            Bearer for X-Session-Token. Server stores only its hash.
-            Also used as the WS `token` query param and for rejoin.
+            Per-seat credential for X-Session-Token. The server stores
+            only its hash. Valid for rejoin within the grace period.
         isCreator: { type: boolean }
-        rejoined: { type: boolean, default: false }
+        rejoined:
+          type: boolean
+          default: false
+        phase: { $ref: "#/components/schemas/Phase" }
         ttlExpiresAt: { type: string, format: date-time }
+        snapshotUrl:
+          type: string
+          format: uri
+          description: Present when phase is past LOBBY; a rejoining
+            client should fetch it immediately.
 
     RoomState:
       type: object
-      required: [phase, players, canStart, ttlExpiresAt]
+      required: [phase, players, canStart, isCreator, ttlExpiresAt]
       properties:
         phase: { $ref: "#/components/schemas/Phase" }
         players:
           type: array
           items:
             type: object
-            required: [playerId, name, isCreator]
+            required: [playerId, name, isCreator, connected]
             properties:
               playerId: { type: string, format: uuid }
               name: { $ref: "#/components/schemas/DisplayName" }
@@ -706,9 +1117,35 @@ components:
               connected: { type: boolean }
         canStart:
           type: boolean
-          description: True only for the creator when 4-8 players present.
+          description: True only for the creator with 4-8 players.
         isCreator: { type: boolean }
         ttlExpiresAt: { type: string, format: date-time }
+
+    ReplayResponse:
+      type: object
+      required: [newRoomId, newRoomCode, seatClaimExpiresAt]
+      properties:
+        newRoomId: { type: string, format: uuid }
+        newRoomCode:
+          type: string
+          pattern: "^[A-Z0-9]{4}$"
+        seatClaimExpiresAt:
+          type: string
+          format: date-time
+          description: |
+            Players (including the creator) claim seats in the new
+            room by POSTing to /rooms/{newRoomCode}/join with their
+            EXISTING session token before this time. Unclaimed seats
+            expire with the window.
+
+    WsTicket:
+      type: object
+      required: [ticket, expiresAt]
+      properties:
+        ticket:
+          type: string
+          description: Single-use; opens exactly one WebSocket.
+        expiresAt: { type: string, format: date-time }
 
     # ------------------------------------------------------------- Author
 
@@ -716,25 +1153,28 @@ components:
       type: integer
       enum: [1, 2, 3, 4]
       description: |
-        1 = under $15, 2 = $15-$60, 3 = $60-$200, 4 = over $200.
-        The ONLY price information an author ever receives.
+        1 = under $15, 2 = $15–$60 (15.00 inclusive, exclusive at 60),
+        3 = $60–$200, 4 = over $200. Boundary rule: a price exactly ON
+        a boundary in dollars belongs to the HIGHER band. The ONLY
+        price information an author ever receives. Derived
+        server-side from the immutable price snapshot.
 
     AuthorCardView:
       type: object
-      required: [cardId, imageUrl, priceBand, deadlineAt, constraints]
+      required: [cardId, imageUrl, priceBand, deadlineAt, constraints, status]
       description: |
-        Author's secret view. Contains image + price band ONLY.
-        No title, no description, no exact price, no review data.
+        Author's secret view: image + price band ONLY. No title, no
+        description, no exact price, no review data.
       properties:
         cardId: { type: string, format: uuid }
         imageUrl:
           type: string
           format: uri
-          description: |
-            Short-lived signed URL scoped to this player and the
-            AUTHOR phase window. Re-encoded, metadata-stripped.
+          description: Short-lived signed URL scoped to this player
+            and the AUTHOR phase window.
         priceBand: { $ref: "#/components/schemas/PriceBand" }
         deadlineAt: { type: string, format: date-time }
+        status: { $ref: "#/components/schemas/CardStatus" }
         constraints:
           type: object
           description: Mirrored client-side for live inline validation.
@@ -743,6 +1183,7 @@ components:
             titleMaxChars: { type: integer, const: 60 }
             bulletMinChars: { type: integer, const: 15 }
             bulletMaxChars: { type: integer, const: 80 }
+            bulletSlots: { type: integer, const: 3 }
             starRatingMin: { type: number, const: 1.0 }
             starRatingMax: { type: number, const: 5.0 }
             starRatingStep: { type: number, const: 0.5 }
@@ -750,46 +1191,67 @@ components:
     AuthorCardSubmission:
       type: object
       description: |
-        Constrained form. Omitted fields are stored blank (partial
-        submit on timeout is legal); all present fields are validated.
+        Every field is individually optional to support the partial
+        submission rule. Bullets are 0–3 strings, each independently
+        optional — a two-bullet submission is valid and stored as a
+        two-item array.
       properties:
         title:
-          type: string
+          type:
+            - string
+            - "null"
           minLength: 8
           maxLength: 60
+          description: null or omitted = left blank.
         bullets:
-          type: array
-          minItems: 3
+          type:
+            - array
+            - "null"
           maxItems: 3
           items:
             type: string
             minLength: 15
             maxLength: 80
+          description: |
+            0 to 3 bullet strings. Fewer than 3 is a valid partial
+            submission. null/omitted = no bullets.
         starRating:
-          type: number
+          type:
+            - number
+            - "null"
           minimum: 1.0
           maximum: 5.0
           multipleOf: 0.5
         reviewBucket:
-          type: string
+          type:
+            - string
+            - "null"
           enum:
             - UNDER_10
             - TEN_TO_99
             - HUNDRED_TO_999
             - THOUSAND_TO_9999
             - TEN_THOUSAND_PLUS
+            - null
         category:
-          type: string
-          description: Slug from the ~12 category dropdown.
+          type:
+            - string
+            - "null"
+          description: Slug from the ~12-category dropdown.
 
     AuthorCardStored:
       allOf:
         - $ref: "#/components/schemas/AuthorCardSubmission"
         - type: object
-          required: [cardId, submitted]
+          required: [cardId, status]
           properties:
             cardId: { type: string, format: uuid }
-            submitted: { type: boolean }
+            status: { $ref: "#/components/schemas/CardStatus" }
+            submittedAt:
+              type:
+                - string
+                - "null"
+              format: date-time
 
     AuthorValidationError:
       allOf:
@@ -799,7 +1261,6 @@ components:
           properties:
             fieldErrors:
               type: array
-              description: Field-level for live inline display.
               items:
                 type: object
                 required: [field, rule, message]
@@ -815,51 +1276,81 @@ components:
                       - CURRENCY_SYMBOL_REJECTED
                       - PRICE_WORD_REJECTED
                       - PROFANITY_REJECTED
-                      - BULLETS_COUNT
+                      - BULLET_COUNT
                       - STAR_RATING_STEP
                       - CATEGORY_UNKNOWN
                   message:
                     type: string
-                    description: Includes the offending word when a
-                      word list rule fired.
+                    description: Names the offending word for
+                      word-list rules, for inline display.
 
     # -------------------------------------------------------------- Guess
 
     GuessQueue:
       type: object
-      required: [cards, progress]
+      required: [cards, myPosition, progress]
       properties:
         cards:
           type: array
-          description: Shuffled per THIS player.
+          description: |
+            Shuffled per THIS player. SUBMITTED cards only — skipped
+            cards are absent and not counted. Content access is still
+            gated by the open endpoint's state machine regardless of
+            which IDs a client holds.
           items:
             type: object
             required: [cardId, status]
             properties:
               cardId: { type: string, format: uuid }
-              status:
-                type: string
-                enum: [UNOPENED, IN_PROGRESS, LOCKED]
+              status: { $ref: "#/components/schemas/GuessStatus" }
+        myPosition:
+          type: object
+          description: The server's authoritative queue position.
+          required: [activeCardId]
+          properties:
+            activeCardId:
+              type:
+                - string
+                - "null"
+              format: uuid
+              description: The one active card, or null.
+            nextCardId:
+              type:
+                - string
+                - "null"
+              format: uuid
+            allDone: { type: boolean }
         progress:
           type: object
-          description: |
-            Counts only — NEVER guess values (anti-herding).
-          required: [locked, total, allPlayersDone]
+          description: Counts only — NEVER guess values.
+          required: [myLocked, myTimedOut, myTotal, allPlayersDone]
           properties:
-            locked: { type: integer }
-            total: { type: integer }
+            myLocked: { type: integer }
+            myTimedOut: { type: integer }
+            myTotal: { type: integer }
             allPlayersDone: { type: boolean }
 
     GuessCardView:
       type: object
       description: |
-        Drip-redacted card. ABSENT fields mean their drip stage has
-        not elapsed. This schema structurally CANNOT carry the image,
-        original title, original description, or true price — those
-        fields do not exist here.
-      required: [cardId, openedAt, capAt, title, category, multiplierNow, locked]
+        Drip-redacted card, valid for both the open response and
+        read-only GETs. ABSENT field = drip stage not reached;
+        `null` = stage reached but the author left the field blank.
+        This schema structurally cannot carry the image, original
+        title, original description, or true price — those fields do
+        not exist here.
+      required:
+        - cardId
+        - status
+        - openedAt
+        - capAt
+        - lockEligibleAt
+        - multiplierNow
+        - draftValueCents
+        - sliderTouched
       properties:
         cardId: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/GuessStatus" }
         openedAt: { type: string, format: date-time }
         capAt:
           type: string
@@ -870,123 +1361,222 @@ components:
           format: date-time
           description: openedAt + 3s minimum dwell.
         # --- 0s drip ---
-        title: { type: string }
-        category: { type: string }
-        # --- 5s drip (absent before) ---
+        title:
+          type:
+            - string
+            - "null"
+        category:
+          type:
+            - string
+            - "null"
+        # --- 5s drip (absent before; null = author left blank) ---
         bullets:
           type: array
-          minItems: 3
           maxItems: 3
-          items: { type: string }
-        # --- 10s drip (absent before) ---
+          items:
+            type:
+              - string
+              - "null"
+        # --- 10s drip ---
         starRating:
-          type: number
-          minimum: 1.0
-          maximum: 5.0
+          type:
+            - number
+            - "null"
         reviewBucket:
-          type: string
+          type:
+            - string
+            - "null"
           enum:
             - UNDER_10
             - TEN_TO_99
             - HUNDRED_TO_999
             - THOUSAND_TO_9999
             - TEN_THOUSAND_PLUS
-        # --- slider state ---
+            - null
+        # --- live slider state (server-authoritative) ---
         multiplierNow:
           type: number
           minimum: 0.7
           maximum: 1.0
           description: Live M(t) for the countdown ring.
-        locked:
-          type: boolean
+        draftValueCents:
+          type:
+            - integer
+            - "null"
+          description: |
+            The server-known draft (last accepted PUT /draft value),
+            or null if never drafted. This is what auto-locks at cap
+            if the slider was touched.
+        sliderTouched: { type: boolean }
+        locked: { type: boolean }
         lockedValueCents:
-          type: integer
+          type:
+            - integer
+            - "null"
           description: Present only when locked=true.
 
-    LockRequest:
+    ValueInput:
       type: object
       required: [valueCents]
       properties:
         valueCents:
           type: integer
-          minimum: 100     # $1.00
-          maximum: 100000  # $1000.00
           description: |
-            Clamped server-side to this range. Cents are meaningful
-            only under $20; the server may round above that.
+            Numeric input. Out-of-range values are CLAMPED to
+            [100, 100000]; at/above $20.00 rounded to whole dollars.
+            Only non-numeric input is rejected.
 
-    LockResponse:
+    ValueEcho:
       type: object
-      required: [cardId, valueCents, formattedValue, lockedAt, cardSeconds, multiplier]
-      description: |
-        Confirmation with haptic/visual echo. NOTE: no points field —
-        points exist only on the server until FINAL.
+      required: [valueCents, formattedValue, wasClamped, wasRounded]
       properties:
-        cardId: { type: string, format: uuid }
         valueCents: { type: integer }
         formattedValue:
           type: string
-          description: e.g. "$12.34" — echoed so typos are visible.
-        lockedAt: { type: string, format: date-time }
-        cardSeconds:
-          type: number
-          minimum: 0
-          maximum: 20
-        multiplier:
-          type: number
-          minimum: 0.7
-          maximum: 1.0
-        nextCardId:
-          type: string
-          format: uuid
-          nullable: true
-          description: null when the queue is done (waiting screen).
+          description: e.g. "$12.34" or "$127" (rounded form above $20).
+        wasClamped: { type: boolean }
+        wasRounded: { type: boolean }
+
+    LockResponse:
+      allOf:
+        - $ref: "#/components/schemas/ValueEcho"
+        - type: object
+          required: [cardId, lockedAt, cardSeconds, multiplier]
+          description: |
+            No points field — points exist only on the server until
+            FINAL.
+          properties:
+            cardId: { type: string, format: uuid }
+            lockedAt: { type: string, format: date-time }
+            cardSeconds:
+              type: number
+              minimum: 0
+              maximum: 20
+            multiplier:
+              type: number
+              minimum: 0.7
+              maximum: 1.0
+            nextCardId:
+              type:
+                - string
+                - "null"
+              format: uuid
+              description: Null when the queue is done.
+
+    # ---------------------------------------------------------- Snapshot
+
+    GameSnapshot:
+      type: object
+      description: |
+        The authoritative per-player state for reconnect/rejoin
+        recovery. Redaction is identical to the per-resource GETs.
+        Exactly one phase block is present, matching `phase`.
+      required: [roomId, roomCode, playerId, phase, seq]
+      properties:
+        roomId: { type: string, format: uuid }
+        roomCode: { type: string }
+        playerId: { type: string, format: uuid }
+        phase: { $ref: "#/components/schemas/Phase" }
+        seq:
+          type: integer
+          description: Current room event sequence (AsyncAPI); the
+            client can detect staleness against its last known seq.
+        lobby:
+          type: object
+          description: Present when phase is LOBBY.
+          properties:
+            players: { type: array, items: { type: object } }
+        author:
+          type: object
+          description: Present when phase is AUTHOR.
+          properties:
+            card: { $ref: "#/components/schemas/AuthorCardView" }
+            submitted:
+              type: boolean
+            progress:
+              type: object
+              properties:
+                submitted: { type: integer }
+                skipped: { type: integer }
+                total: { type: integer }
+        guess:
+          type: object
+          description: Present when phase is GUESS.
+          properties:
+            queue: { $ref: "#/components/schemas/GuessQueue" }
+            activeCard: { $ref: "#/components/schemas/GuessCardView" }
+        reveal:
+          type: object
+          description: Present when phase is REVEAL.
+          required: [slideIndex, slideCount]
+          properties:
+            slideIndex: { type: integer }
+            slideCount: { type: integer }
+            slide: { $ref: "#/components/schemas/RevealSlide" }
+        vote:
+          type: object
+          description: Present when phase is VOTE.
+          properties:
+            options: { $ref: "#/components/schemas/VoteOptions" }
+            myVoteCast: { type: boolean }
+            deadlineAt: { type: string, format: date-time }
+        final:
+          type: object
+          description: Present when phase is FINAL.
+          properties:
+            scoreboard: { $ref: "#/components/schemas/FinalScoreboard" }
 
     # -------------------------------------------------------------- Reveal
 
     RevealSlide:
       type: object
       description: |
-        The big moment. Original product next to the author's card,
-        with every guess as a labeled dot on a shared log-scale axis.
-        No scores on slides. Slides auto-advance (~12s) or by creator.
-      required:
-        - slideIndex
-        - slideCount
-        - autoAdvanceAt
-        - card
+        Original product next to the author's card, every guess as a
+        labeled dot on a shared log-scale axis. NO points on slides —
+        scores appear only in the final scoreboard.
+      required: [slideIndex, slideCount, autoAdvanceAt, card]
       properties:
         slideIndex: { type: integer }
         slideCount: { type: integer }
         autoAdvanceAt: { type: string, format: date-time }
-        canAdvance: { type: boolean, description: Creator only. }
+        canAdvance:
+          type: boolean
+          description: True only for the room creator.
         card:
           type: object
-          required:
-            - cardId
-            - authorName
-            - authored
-            - original
+          required: [cardId, authorName, authored, original, guesses]
           properties:
             cardId: { type: string, format: uuid }
             authorName: { $ref: "#/components/schemas/DisplayName" }
             authored: { $ref: "#/components/schemas/AuthorCardSubmission" }
             original:
               type: object
-              description: Product secrets released HERE for the first time.
-              required: [imageUrl, title, description, priceCents, snapshotDate, category]
+              description: Product secrets released HERE, for the
+                first time, to everyone.
+              required:
+                [
+                  imageUrl,
+                  title,
+                  description,
+                  priceCents,
+                  snapshotDate,
+                  category,
+                ]
               properties:
                 imageUrl: { type: string, format: uri }
                 title: { type: string }
                 description: { type: string }
                 priceCents: { type: integer }
-                snapshotDate: { type: string, format: date }
+                snapshotDate:
+                  type: string
+                  format: date
+                  description: Calendar date for "snapshot price as of".
                 category: { type: string }
             guesses:
               type: array
               description: |
-                Labeled dots; order is the server's animation order
-                (dots land one by one, ending on the true price).
+                Labeled dots in the server's animation order (dots
+                land one by one, ending on the true price).
               items:
                 type: object
                 required: [playerName, valueCents, lockedAt]
@@ -995,18 +1585,85 @@ components:
                   valueCents: { type: integer }
                   lockedAt: { type: string, format: date-time }
                   cardSeconds:
-                    type: number
-                    description: Lock time for the t-dilemma story.
+                    type:
+                      - number
+                      - "null"
+                    description: Lock time for the t-dilemma story;
+                      null when auto-locked on disconnect.
+                  timedOut:
+                    type: boolean
+                    description: True when locked by cap/disconnect
+                      rather than an explicit player lock.
             axisMinCents: { type: integer, const: 100 }
             axisMaxCents: { type: integer, const: 100000 }
 
-    # --------------------------------------------------------------- Final
+    # ---------------------------------------------------------- Vote/Final
+
+    VoteOptions:
+      type: object
+      required: [options, deadlineAt]
+      properties:
+        options:
+          type: array
+          description: SUBMITTED cards excluding the voter's own.
+          items:
+            type: object
+            required: [cardId, authorName, title, category]
+            properties:
+              cardId: { type: string, format: uuid }
+              authorName: { $ref: "#/components/schemas/DisplayName" }
+              title:
+                type:
+                  - string
+                  - "null"
+              category:
+                type:
+                  - string
+                  - "null"
+              starRating:
+                type:
+                  - number
+                  - "null"
+              reviewBucket:
+                type:
+                  - string
+                  - "null"
+                enum:
+                  [
+                    UNDER_10,
+                    TEN_TO_99,
+                    HUNDRED_TO_999,
+                    THOUSAND_TO_9999,
+                    TEN_THOUSAND_PLUS,
+                    null,
+                  ]
+        deadlineAt:
+          type: string
+          format: date-time
+          description: |
+            Voting ends when all eligible players have voted or at
+            this deadline, whichever comes first. Non-voters record
+            no vote.
+        myVoteCast: { type: boolean }
 
     FinalScoreboard:
       type: object
-      required: [rankings, winnerPlayerId]
+      required: [endedReason, rankings, winnerPlayerId]
       properties:
-        winnerPlayerId: { type: string, format: uuid }
+        endedReason:
+          type: string
+          enum: [COMPLETED, TOO_FEW_PLAYERS]
+          description: |
+            TOO_FEW_PLAYERS: a votekick dropped the room under 4;
+            only the cards completed by that point are included. The
+            client never infers how an interrupted game resolves.
+        winnerPlayerId:
+          type:
+            - string
+            - "null"
+          format: uuid
+          description: Null when endedReason is TOO_FEW_PLAYERS and
+            too few cards completed to rank.
         rankings:
           type: array
           items:
@@ -1028,28 +1685,42 @@ components:
                   funniestBonus: { type: integer }
               perCard:
                 type: array
-                description: Per-card detail for the breakdown view.
                 items:
                   type: object
-                  required: [cardId, role]
+                  required: [cardId, role, status]
                   properties:
                     cardId: { type: string, format: uuid }
                     role: { type: string, enum: [GUESSER, AUTHOR] }
+                    status:
+                      description: |
+                        Per-role lifecycle, so zeros are
+                        distinguishable from absence.
+                      oneOf:
+                        - $ref: "#/components/schemas/GuessStatus"
+                        - $ref: "#/components/schemas/CardStatus"
                     points: { type: integer }
                     accuracy:
-                      type: number
-                      nullable: true
-                    lockedAt: { type: string, format: date-time, nullable: true }
+                      type:
+                        - number
+                        - "null"
+                    lockedAt:
+                      type:
+                        - string
+                        - "null"
+                      format: date-time
                     funniestVotes:
-                      type: integer
-                      nullable: true
+                      type:
+                        - integer
+                        - "null"
                       description: Author rows only.
 
     # ---------------------------------------------------------- Moderation
 
     ReportRequest:
       type: object
-      required: [roomCode, reason]
+      description: |
+        Exactly one of reportedCardId / reportedPlayerId must be
+        present, and the target must belong to the reporter's room.
       properties:
         roomCode:
           type: string
@@ -1061,116 +1732,94 @@ components:
           enum: [OFFENSIVE_CONTENT, OFFENSIVE_NAME, AFK, OTHER]
         note: { type: string, maxLength: 500 }
 
+    ReportAdmin:
+      type: object
+      required: [id, roomCode, reason, status, createdAt]
+      properties:
+        id: { type: integer }
+        roomCode: { type: string }
+        reportedCardId:
+          type:
+            - string
+            - "null"
+          format: uuid
+        reportedPlayerId:
+          type:
+            - string
+            - "null"
+          format: uuid
+        reporterPlayerId: { type: string, format: uuid }
+        reason:
+          type: string
+          enum: [OFFENSIVE_CONTENT, OFFENSIVE_NAME, AFK, OTHER]
+        note:
+          type:
+            - string
+            - "null"
+        status:
+          type: string
+          enum: [OPEN, RESOLVED, DISMISSED]
+        resolutionNote:
+          type:
+            - string
+            - "null"
+        createdAt: { type: string, format: date-time }
+
     # --------------------------------------------------------------- Admin
 
     ProductAdmin:
       type: object
-      required: [originalTitle, originalDescription, priceCents, category, snapshotDate]
+      description: |
+        ADMIN ONLY. Contains full product secrets. Images are
+        registered out of band by the ingestion pipeline; reference
+        them here by storage key.
+      required:
+        [
+          imageStorageKey,
+          originalTitle,
+          originalDescription,
+          priceCents,
+          category,
+          snapshotDate,
+        ]
       properties:
         id: { type: integer, readOnly: true }
-        imageStorageKey: { type: string }
-        originalTitle: { type: string }
-        originalDescription: { type: string }
-        priceCents: { type: integer, minimum: 200, maximum: 50000 }
-        currency: { type: string, default: USD }
+        imageStorageKey:
+          type: string
+          description: "Format: products/{contentHash}.webp|jpg — must
+            reference an already-registered image."
+        originalTitle: { type: string, maxLength: 512 }
+        originalDescription: { type: string, maxLength: 4096 }
+        priceCents:
+          type: integer
+          minimum: 200
+          maximum: 50000
+          description: Curated pool is $2–$500 (USD only).
+        currency:
+          type: string
+          const: USD
+          description: |
+            Fixed to USD. Slider range, price bands, and scoring all
+            assume USD; other currencies are rejected.
         category: { type: string }
         starRating:
-          type: number
+          type:
+            - number
+            - "null"
           minimum: 1.0
           maximum: 5.0
-          nullable: true
-        reviewCount: { type: integer, nullable: true }
-        snapshotDate: { type: string, format: date }
+        reviewCount:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+        snapshotDate:
+          type: string
+          format: date
+          description: Calendar date (date, not datetime), matching
+            the reveal copy.
         priceBand:
           allOf: [{ $ref: "#/components/schemas/PriceBand" }]
           readOnly: true
-          description: Derived server-side from priceCents.
+          description: Derived server-side from the immutable price.
         active: { type: boolean, default: true }
-
-    # ---------------------------------------------------------- Realtime
-
-    WsServerEvent:
-      oneOf:
-        - $ref: "#/components/schemas/WsEventPhaseChanged"
-        - $ref: "#/components/schemas/WsEventPlayerPresence"
-        - $ref: "#/components/schemas/WsEventDripRevealed"
-        - $ref: "#/components/schemas/WsEventLockConfirmed"
-        - $ref: "#/components/schemas/WsEventGuessProgress"
-        - $ref: "#/components/schemas/WsEventSlideChanged"
-        - $ref: "#/components/schemas/WsEventGameOver"
-      description: |
-        Push-only server events. Clients send gameplay inputs via REST;
-        this socket never accepts game inputs (server authority,
-        rate-limiting, clamping all happen on the REST path).
-
-    WsEventPhaseChanged:
-      type: object
-      required: [type, phase, at]
-      properties:
-        type: { type: string, const: "phase_changed" }
-        phase: { $ref: "#/components/schemas/Phase" }
-        deadlineAt: { type: string, format: date-time, nullable: true }
-        at: { type: string, format: date-time }
-
-    WsEventPlayerPresence:
-      type: object
-      required: [type, presence, playerId]
-      properties:
-        type: { type: string, const: "player_presence" }
-        presence: { type: string, enum: [JOINED, LEFT, KICKED] }
-        playerId: { type: string, format: uuid }
-        name: { $ref: "#/components/schemas/DisplayName" }
-
-    WsEventDripRevealed:
-      type: object
-      required: [type, cardId, stage]
-      description: |
-        Fired with the drip pulse + sound so it's noticed
-        mid-conversation.
-      properties:
-        type: { type: string, const: "drip_revealed" }
-        cardId: { type: string, format: uuid }
-        stage:
-          type: string
-          enum: [STAGE_BULLETS, STAGE_RATING]  # 5s / 10s
-        at: { type: string, format: date-time }
-
-    WsEventLockConfirmed:
-      type: object
-      required: [type, cardId]
-      description: Local lock ack (haptic + visual confirmation trigger).
-      properties:
-        type: { type: string, const: "lock_confirmed" }
-        cardId: { type: string, format: uuid }
-        nextCardId: { type: string, format: uuid, nullable: true }
-
-    WsEventGuessProgress:
-      type: object
-      required: [type, locked, total]
-      description: |
-        Counts only — never values. Drives the "3 of 5 locked"
-        indicator and the all-done transition.
-      properties:
-        type: { type: string, const: "guess_progress" }
-        locked: { type: integer }
-        total: { type: integer }
-
-    WsEventSlideChanged:
-      type: object
-      required: [type, slideIndex]
-      properties:
-        type: { type: string, const: "slide_changed" }
-        slideIndex: { type: integer }
-        autoAdvanceAt: { type: string, format: date-time }
-
-    WsEventGameOver:
-      type: object
-      required: [type]
-      properties:
-        type: { type: string, const: "game_over" }
-        reason:
-          type: string
-          enum: [COMPLETED, TOO_FEW_PLAYERS]
-          description: |
-            TOO_FEW_PLAYERS: votekick dropped the room under 4;
-            cards completed so far are shown.
