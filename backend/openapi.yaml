@@ -1,0 +1,3207 @@
+openapi: 3.1.0
+info:
+  description: |
+    Mobile-first multiplayer party game: players author a product card
+    from an image, then guess each other's prices.
+
+    Invariants enforced by this contract:
+
+    1. **Server authority.** Clients send inputs only. The server owns
+       phase transitions, timers, drip schedules, lock timestamps,
+       scoring, and vote tallies. All timestamps in responses are
+       server-stamped; client clocks are never trusted.
+    2. **Secrets stay server-side.** `priceCents`, `originalTitle`,
+       `originalDescription`, and the product image are never present
+       in any response consumed before the REVEAL phase — including
+       error payloads. Guesser-facing schemas have no fields that
+       could carry them. The image URL is issued only to the card's
+       author, scoped to the AUTHOR phase window.
+    3. **Scores are hidden until FINAL.** No running totals anywhere.
+    4. **Guess values are hidden until REVEAL.** Progress is counts
+       only, never values.
+    5. **All money is integer cents.** Slider range $1–$1000, i.e.
+       valueCents in [100, 100000]. Numeric out-of-range input is
+       CLAMPED and echoed; only non-numeric input is rejected (422).
+       At or above $20.00 the server rounds to the nearest whole
+       dollar; below $20.00 cents are preserved. Clamped and rounded
+       values are what is stored, displayed, and scored.
+    6. **Card lifecycle:** `ASSIGNED -> SUBMITTED | SKIPPED`. Skipped
+       cards (timeout / disconnect) are excluded from the guess queue,
+       reveal carousel, vote options, and author scoring. All totals
+       count SUBMITTED cards only.
+    7. **Token-room binding.** Every authenticated endpoint under
+       /rooms/{roomCode} or /games requires the session token to
+       resolve to a seat in THAT room, else 403 WRONG_ROOM.
+
+    Realtime events (push-only WebSocket) are specified in the
+    companion AsyncAPI document. Gameplay inputs go through REST.
+
+    Room codes (4 chars, ~1.7M possibilities) are a convenience
+    identifier, NOT a security boundary. Join attempts are
+    rate-limited per IP and per failed room code.
+  license:
+    name: Proprietary
+  title: Impulse Buy API
+  version: 2.0.0
+servers:
+- description: Production
+  url: https://api.impulsebuy.example/v1
+security:
+- sessionToken: []
+tags:
+- name: Rooms
+- name: Session
+- name: Author
+- name: Guess
+- name: Reveal
+- name: Vote & Final
+- name: Moderation
+- name: Admin
+- name: System
+paths:
+  /health:
+    get:
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/_health_get_200_response"
+          description: OK
+      security: []
+      summary: Liveness probe
+      tags:
+      - System
+  /rooms:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/_rooms_post_request"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JoinResponse"
+          description: Room created; caller joined as creator.
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+      security: []
+      summary: Create a room and join as creator
+      tags:
+      - Rooms
+  /rooms/{roomCode}/join:
+    post:
+      description: |
+        Two distinct operations, discriminated by the request body:
+
+        * **New join:** requires `name`. Creates a new seat and a new
+          session token. Returns 409 if the game is in progress, the
+          room is full, or the name is taken.
+        * **Rejoin:** requires `sessionToken` (an existing token from
+          this room). Resolves the existing seat BEFORE any new-join
+          prohibition applies — so rejoining during AUTHOR or GUESS is
+          explicitly permitted. `name` is optional and ignored.
+          Returns the same session token, plus the current phase so
+          the client can fetch a snapshot. Rejoin is permitted in
+          LOBBY, AUTHOR, GUESS, REVEAL, and VOTE; in FINAL the token
+          resolves but the room is read-only.
+
+        A failed room code is throttled per IP (429) to blunt
+        enumeration of the 4-character code space.
+      parameters:
+      - $ref: "#/components/parameters/RoomCode"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/_rooms__roomCode__join_post_request"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JoinResponse"
+          description: Joined or rejoined.
+        "404":
+          $ref: "#/components/responses/RoomNotFound"
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: |
+            New join blocked: game in progress, room full (8), or name
+            taken. Rejoin requests never receive GAME_IN_PROGRESS.
+        "410":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: "Rejoin token expired or seat reclaimed (grace period elapsed,\
+            \ or the room closed)."
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+      security: []
+      summary: "Join a room, or rejoin an existing seat"
+      tags:
+      - Rooms
+  /rooms/{roomCode}:
+    get:
+      description: |
+        Current phase and player list. The session token must belong
+        to a seat in this room. Never contains game secrets or scores.
+      parameters:
+      - $ref: "#/components/parameters/RoomCode"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoomState"
+          description: Room state.
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/RoomNotFound"
+      summary: Room / lobby state
+      tags:
+      - Rooms
+  /rooms/{roomCode}/start:
+    post:
+      description: |
+        Samples N distinct products — log-uniform by price, sampled
+        WITHOUT replacement within the game, one per player — and moves
+        the room to AUTHOR with a 60-second server timer. The
+        (room, product) uniqueness invariant is enforced server-side.
+      parameters:
+      - $ref: "#/components/parameters/RoomCode"
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/_rooms__roomCode__start_post_202_response"
+          description: Game started; room in AUTHOR.
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: "Fewer than 4 players, or game in progress."
+      summary: Start the game (creator only)
+      tags:
+      - Rooms
+  /rooms/{roomCode}/replay:
+    post:
+      description: |
+        REPLAY SEMANTICS (single model): replay always creates a NEW
+        room linked to the old one via replayOfRoomId. The old room,
+        its records, and its scores are immutable history. The creator
+        receives the new room code and a seat-claim window. Every
+        player (including the creator) claims a seat in the new room
+        by calling join with their EXISTING session token inside the
+        window; the server maps old token to new seat, so no new
+        credentials are issued and no player ever receives another
+        player's token. Unclaimed seats expire with the window.
+      parameters:
+      - $ref: "#/components/parameters/RoomCode"
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReplayResponse"
+          description: New room created; seat claim window opened.
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: Not in FINAL phase.
+      summary: "Create a replay room (creator only, FINAL phase only)"
+      tags:
+      - Vote & Final
+  /ws/ticket:
+    post:
+      description: |
+        Exchanges the long-lived session token (header) for a
+        short-lived, single-use connection ticket for the AsyncAPI
+        WebSocket. The session token itself never appears in a URL or
+        query string. Tickets expire in 60 seconds and open exactly
+        one connection.
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WsTicket"
+          description: Ticket minted.
+        "429":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: Ticket minting rate-limited (per session).
+      summary: Mint a single-use WebSocket ticket
+      tags:
+      - Session
+  /games/current/snapshot:
+    get:
+      description: |
+        THE recovery contract for reconnects and mid-game rejoins.
+        Returns the absolute, per-phase, per-player redacted state:
+        phase and deadlines, queue position and per-card statuses,
+        the active card with its drip-redacted fields, the server-side
+        draft value, lock states, current reveal slide index, and vote
+        options. Redaction rules are identical to the per-resource
+        GET endpoints. The client refetches this after any reconnect
+        where it may have missed events; the WebSocket stream is a
+        live view, this is the truth.
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GameSnapshot"
+          description: Snapshot.
+        "409":
+          $ref: "#/components/responses/PhaseError"
+      summary: Authoritative per-player state snapshot
+      tags:
+      - Session
+  /games/current/author-card:
+    get:
+      description: |
+        Returns ONLY the product image and the coarse price band —
+        never title, description, exact price, or review data. The
+        image URL is signed and scoped to this player and the AUTHOR
+        phase window.
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthorCardView"
+          description: Author card view.
+        "409":
+          $ref: "#/components/responses/PhaseError"
+      summary: Get my card to author
+      tags:
+      - Author
+    put:
+      description: |
+        Server-side validation: length rules, digit / number-word /
+        currency-symbol / price-word rejection, profanity filter.
+        Fields are individually optional to support the PRD's partial
+        submission rule: filled fields are stored, the rest remain
+        blank (null). An author who submits nothing before the 60s
+        timeout is marked SKIPPED — that card is excluded from the
+        queue, carousel, and votes, and scores no author points.
+        Repeated PUTs before the deadline overwrite the stored card
+        (last write wins); after the deadline the card is final.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthorCardSubmission"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthorCardStored"
+          description: Card stored (fully or partially).
+        "409":
+          $ref: "#/components/responses/PhaseError"
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthorValidationError"
+          description: |
+            Validation failure. `fieldErrors` is field-level for live
+            inline display; each entry names the rule and, for
+            word-list rules, the offending word.
+      summary: Submit my authored card (full or partial)
+      tags:
+      - Author
+  /games/current/guess/queue:
+    get:
+      description: |
+        Card order is shuffled PER PLAYER, so card positions reveal
+        nothing on voice chat. Only SUBMITTED cards appear; skipped
+        cards are excluded and not counted in totals. Exposes card IDs
+        and statuses only — content access is governed by the
+        server-side one-active-card state machine on the open
+        endpoint, regardless of what IDs a client holds.
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuessQueue"
+          description: Queue stubs plus progress counts.
+        "409":
+          $ref: "#/components/responses/PhaseError"
+      summary: My shuffled card queue
+      tags:
+      - Guess
+  /games/current/guess/cards/{cardId}/open:
+    post:
+      description: |
+        THE queue state machine, server-enforced:
+
+        * Exactly ONE active card per player at any time.
+        * Only the player's NEXT eligible card may be opened. Opening
+          a future card, a locked card, an already-open card, or a
+          card not in this player's queue is rejected (409/404).
+        * Opening a card starts its drip timers ONCE; retries can
+          never reset or extend them.
+        * A locked card cannot be reopened or modified.
+        * The server, not the client, determines queue position and
+          whether a lock advances it.
+
+        This is a POST because it changes state; the GET on the card
+        is read-only and always returns the current representation.
+      parameters:
+      - $ref: "#/components/parameters/CardId"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuessCardView"
+          description: Card opened; returns the 0s-drip representation.
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: Card not in this player's queue.
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: |
+            Not the next eligible card, another card is active, the
+            card is locked, or wrong phase. The error carries the
+            client's authoritative queue position so it can recover.
+        "429":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: Open attempts rate-limited (anti-fuzzing).
+      summary: Open the next card (starts its drip schedule)
+      tags:
+      - Guess
+  /games/current/guess/cards/{cardId}:
+    get:
+      description: |
+        Read-only. NEVER starts or resets timers — only `open` does.
+        The card's information is determined by the server clock
+        relative to the server-recorded `openedAt`:
+
+        * 0s — title, category
+        * 5s — bullet slots
+        * 10s — star rating, review-count bucket
+        * 20s — hard cap; latest draft value auto-locks
+
+        ABSENT field = drip stage not reached. `null` = the stage is
+        reached but the author left the field blank. Distinct
+        meanings, never conflated. This schema structurally cannot
+        carry the image, original title, original description, or
+        price.
+      parameters:
+      - $ref: "#/components/parameters/CardId"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuessCardView"
+          description: Drip-redacted card view.
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: Card not in this player's queue.
+        "409":
+          $ref: "#/components/responses/PhaseError"
+      summary: "Read my active card (drip-redacted, read-only)"
+      tags:
+      - Guess
+  /games/current/guess/cards/{cardId}/draft:
+    put:
+      description: |
+        Keeps the latest slider position in authoritative server
+        state. THIS is what makes the disconnect auto-lock rule
+        implementable: a player who drafts $127.50, touches the
+        slider, and then loses their connection has their draft
+        auto-locked at the card's 20s cap. A player who never touched
+        the slider scores zero. Drafts are throttled server-side
+        (coalesced; only the latest value matters) and are NOT
+        persisted per-keystroke — the latest value is authoritative
+        and persisted at lock time or cap time. Numeric values are
+        clamped to [100, 100000] cents and rounded per the money
+        rule; the normalized value is echoed.
+      parameters:
+      - $ref: "#/components/parameters/CardId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ValueInput"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValueEcho"
+          description: Draft accepted (and normalized).
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: Card not in this player's queue.
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: "Card is not the active card, already locked, or wrong phase."
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: Non-numeric / unparseable value.
+      summary: Update the server-side draft value (the slider position)
+      tags:
+      - Guess
+  /games/current/guess/cards/{cardId}/touch:
+    post:
+      description: |
+        Idempotent. Lock is disabled until the slider has been
+        touched AND 3 seconds of minimum dwell have elapsed since
+        open. Touch state also governs disconnect auto-lock
+        (auto-lock fires only if touched).
+      parameters:
+      - $ref: "#/components/parameters/CardId"
+      responses:
+        "204":
+          description: Touch recorded (idempotent).
+        "409":
+          $ref: "#/components/responses/PhaseError"
+      summary: Report slider touched (enables Lock)
+      tags:
+      - Guess
+  /games/current/guess/cards/{cardId}/lock:
+    post:
+      description: |
+        Commits the guess permanently and advances the queue. The
+        lock timestamp is stamped by the SERVER. The live multiplier
+        is M(t) = 1.0 - 0.3 * (t / 20), t = server-measured seconds on
+        the card, clamped to [0, 20]. Points are computed server-side
+        but NEVER returned before FINAL.
+
+        Value handling: numeric input is clamped to [100, 100000]
+        cents and rounded per the money rule ($20+ -> whole dollars);
+        the normalized value is echoed with `wasClamped`/`wasRounded`
+        flags so typos are visible. Non-numeric input is rejected
+        (422). Locking without a prior draft/touch is rejected (403
+        SLIDER_UNTOUCHED).
+      parameters:
+      - $ref: "#/components/parameters/CardId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ValueInput"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LockResponse"
+          description: Lock confirmed.
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: |
+            Minimum dwell (3s) not met, slider untouched, or card
+            already locked.
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: Card not in this player's queue.
+        "409":
+          $ref: "#/components/responses/PhaseError"
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: Non-numeric value.
+      summary: Lock my guess (permanent)
+      tags:
+      - Guess
+  /games/current/reveal:
+    get:
+      description: |
+        Shared carousel over the SUBMITTED cards, shuffled order,
+        ~12s per slide, auto-advancing; the creator can advance
+        early. This is the only pre-FINAL context in which product
+        secrets (image, original title/description, true price) are
+        released. Slides carry NO points — scores appear only on the
+        final scoreboard (this resolves the PRD's internal
+        contradiction in favor of hidden scores).
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevealSlide"
+          description: Current slide.
+        "409":
+          $ref: "#/components/responses/PhaseError"
+      summary: Current reveal slide
+      tags:
+      - Reveal
+  /games/current/reveal/advance:
+    post:
+      responses:
+        "202":
+          description: Advanced.
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/PhaseError"
+      summary: Advance the carousel early (creator only)
+      tags:
+      - Reveal
+  /games/current/vote/options:
+    get:
+      description: |
+        The canonical vote-phase representation: the SUBMITTED cards
+        excluding the voter's own, with the minimal presentation
+        needed to choose one. A rejoining client that missed slides
+        recovers its options from here (and from the snapshot).
+        Individual votes and tallies remain hidden until FINAL.
+        Voting ends when all eligible players have voted OR the vote
+        deadline (server-set, ~30s, tunable) expires; non-voters
+        simply record no vote and cost no one anything.
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoteOptions"
+          description: Vote options.
+        "409":
+          $ref: "#/components/responses/PhaseError"
+      summary: Cards eligible for my funniest-card vote
+      tags:
+      - Vote & Final
+  /games/current/vote:
+    post:
+      description: |
+        One hidden vote per player, for a card that is not the
+        voter's own. The vote is FINAL when cast — it cannot be
+        replaced or withdrawn (409 ALREADY_VOTED). Most votes wins
+        +300 for the author, split on ties. Votes cast for a card
+        whose author is later kicked are discarded; the kicked
+        player's own vote is also discarded.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/_games_current_vote_post_request"
+        required: true
+      responses:
+        "202":
+          description: Vote recorded.
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: Cannot vote for own card.
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: "Already voted, or wrong phase."
+      summary: "Cast funniest-card vote (one, final)"
+      tags:
+      - Vote & Final
+  /games/current/final:
+    get:
+      description: |
+        Ranked scoreboard with full breakdown. Also the result for
+        EARLY-ENDED games: `endedReason` is TOO_FEW_PLAYERS when a
+        votekick dropped the room under 4 players, and the response
+        includes only the cards completed by that point — the client
+        never has to infer how an interrupted phase resolves.
+        Author points use the mean accuracy over ALL eligible
+        guessers on the card (kicked players excluded; zero-accuracy
+        and timed-out guesses count as 0 in the denominator — never
+        a mean over locked guesses only).
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FinalScoreboard"
+          description: Final scoreboard.
+        "409":
+          $ref: "#/components/responses/PhaseError"
+      summary: Final scoreboard
+      tags:
+      - Vote & Final
+  /reports:
+    post:
+      description: |
+        For offensive content or AFK only. Exactly one of
+        reportedCardId / reportedPlayerId must be present, and the
+        target must belong to the reporter's room. Reports never
+        carry game secrets to moderators before the reveal.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReportRequest"
+        required: true
+      responses:
+        "202":
+          description: Report recorded.
+        "422":
+          $ref: "#/components/responses/ValidationError"
+      summary: Report a card or a player
+      tags:
+      - Moderation
+  /rooms/{roomCode}/votekick:
+    post:
+      description: |
+        Reasons are offensive content or AFK only — NOT cheating
+        accusations (per PRD). Semantics:
+
+        * Exactly one ACTIVE votekick per room; the active vote must
+          resolve or expire before a different target can be raised
+          (409 VOTEKICK_IN_PROGRESS).
+        * One vote per player per votekick. Duplicate calls are
+          idempotent: they return the current tally and emit no event.
+        * Threshold: ceil(2/3 of OTHER players), evaluated on each
+          new vote; the kick executes when reached.
+        * The votekick expires after 30s without reaching threshold.
+        * A kicked player's card and guesses are removed from
+          everyone's totals; their vote is discarded, and votes cast
+          for their card are discarded. Scoring is prior-based, so
+          removal requires no crowd recomputation.
+        * If fewer than 4 players remain, the game ends early:
+          phase moves to FINAL with endedReason TOO_FEW_PLAYERS and
+          the completed cards.
+        * If the target disconnects before resolution, the votekick
+          is CANCELLED (no kick; disconnect rules apply instead).
+      parameters:
+      - $ref: "#/components/parameters/RoomCode"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/_rooms__roomCode__votekick_post_request"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/_rooms__roomCode__votekick_post_200_response"
+          description: |
+            Vote recorded or duplicate (idempotent). Returns the
+            current tally.
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+          description: |
+            Another votekick is active for a different target, or
+            wrong phase.
+      summary: Cast a votekick vote (idempotent)
+      tags:
+      - Moderation
+  /admin/products:
+    get:
+      parameters:
+      - explode: true
+        in: query
+        name: active
+        required: false
+        schema:
+          title: active
+          type: boolean
+        style: form
+      - explode: true
+        in: query
+        name: category
+        required: false
+        schema:
+          type: string
+        style: form
+      - explode: true
+        in: query
+        name: priceBand
+        required: false
+        schema:
+          maximum: 4
+          minimum: 1
+          type: integer
+        style: form
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: "#/components/schemas/ProductAdmin"
+                type: array
+                default: null
+          description: Products.
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+      security:
+      - adminAuth: []
+      summary: List products (full secrets)
+      tags:
+      - Admin
+    post:
+      description: |
+        Product images are imported and registered OUT OF BAND (the
+        ingestion pipeline re-encodes, strips metadata and filenames,
+        and writes the ProductImage row). This endpoint references an
+        already-registered image by `imageStorageKey`, whose format is
+        `products/{contentHash}.{webp|jpg}`. An unknown storage key is
+        rejected. `snapshotDate` is a calendar date (date, not
+        datetime) and matches the reveal copy ("snapshot price as
+        of …"). `priceBand` is derived server-side from priceCents
+        and is immutable — product price snapshots are immutable
+        after curation; corrections create a new product version.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductAdmin"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductAdmin"
+          description: Created.
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+      security:
+      - adminAuth: []
+      summary: Create a product
+      tags:
+      - Admin
+  /admin/categories/{slug}:
+    patch:
+      parameters:
+      - explode: false
+        in: path
+        name: slug
+        required: true
+        schema:
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/_admin_categories__slug__patch_request"
+        required: true
+      responses:
+        "200":
+          description: Updated.
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+      security:
+      - adminAuth: []
+      summary: Tune a category (sigma)
+      tags:
+      - Admin
+  /admin/reports:
+    get:
+      parameters:
+      - explode: true
+        in: query
+        name: status
+        required: false
+        schema:
+          enum:
+          - OPEN
+          - RESOLVED
+          - DISMISSED
+          type: string
+        style: form
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: "#/components/schemas/ReportAdmin"
+                type: array
+                default: null
+          description: Reports.
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+      security:
+      - adminAuth: []
+      summary: List reports for review
+      tags:
+      - Admin
+  /admin/reports/{reportId}:
+    patch:
+      parameters:
+      - explode: false
+        in: path
+        name: reportId
+        required: true
+        schema:
+          title: votesCast
+          type: integer
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/_admin_reports__reportId__patch_request"
+        required: true
+      responses:
+        "200":
+          description: Updated.
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+      security:
+      - adminAuth: []
+      summary: Resolve or dismiss a report
+      tags:
+      - Admin
+components:
+  parameters:
+    RoomCode:
+      description: "4-character room code (convenience ID, not a secret)."
+      explode: false
+      in: path
+      name: roomCode
+      required: true
+      schema:
+        maxLength: 4
+        minLength: 4
+        pattern: "^[A-Z0-9]{4}$"
+        type: string
+      style: simple
+    CardId:
+      explode: false
+      in: path
+      name: cardId
+      required: true
+      schema:
+        format: uuid
+        type: string
+      style: simple
+  responses:
+    RoomNotFound:
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+      description: Room not found or TTL-expired.
+    Forbidden:
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+      description: |
+        Not the room creator, token not bound to this room
+        (WRONG_ROOM), or action forbidden for this seat.
+    PhaseError:
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/inline_object"
+      description: Operation not valid for the current phase.
+    ValidationError:
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/inline_object_1"
+      description: Input validation failure.
+    RateLimited:
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+      description: "Rate-limited (join enumeration, ticket minting, or input flood)."
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          explode: false
+          schema:
+            minimum: 1
+            type: integer
+          style: simple
+    AdminUnauthorized:
+      description: |
+        Missing or invalid admin credential. Player session tokens
+        are never accepted on admin endpoints; the error body is
+        generic and reveals nothing about product data.
+  schemas:
+    Phase:
+      enum:
+      - LOBBY
+      - AUTHOR
+      - GUESS
+      - REVEAL
+      - VOTE
+      - FINAL
+      - CLOSED
+      title: Phase
+      type: string
+    CardStatus:
+      description: |
+        Author-side card lifecycle. SKIPPED (author timeout or
+        disconnect) cards are excluded from the queue, carousel,
+        votes, and author scoring; all totals count SUBMITTED only.
+      enum:
+      - ASSIGNED
+      - SUBMITTED
+      - SKIPPED
+      title: CardStatus
+      type: string
+    GuessStatus:
+      description: |
+        Guesser-side per-card lifecycle. TIMED_OUT = capped at 20s
+        (auto-locked draft if touched, else zero). SKIPPED = the
+        card's author was kicked or the game ended early before this
+        card was playable.
+      enum:
+      - UNOPENED
+      - IN_PROGRESS
+      - LOCKED
+      - TIMED_OUT
+      - SKIPPED
+      title: GuessStatus
+      type: string
+    DisplayName:
+      description: Profanity-filtered on the server.
+      maxLength: 24
+      minLength: 2
+      title: DisplayName
+      type: string
+    Error:
+      description: |
+        Error bodies are generic. They never contain product data,
+        other players' guesses, or scores.
+      example:
+        code: ROOM_NOT_FOUND
+        message: message
+      properties:
+        code:
+          enum:
+          - ROOM_NOT_FOUND
+          - ROOM_FULL
+          - GAME_IN_PROGRESS
+          - NAME_TAKEN
+          - REJOIN_EXPIRED
+          - WRONG_ROOM
+          - NOT_CREATOR
+          - WRONG_PHASE
+          - NOT_IN_QUEUE
+          - NOT_NEXT_CARD
+          - CARD_ACTIVE
+          - ALREADY_LOCKED
+          - ALREADY_OPENED
+          - ALREADY_VOTED
+          - LOCK_TOO_EARLY
+          - SLIDER_UNTOUCHED
+          - OWN_CARD_FORBIDDEN
+          - VOTEKICK_IN_PROGRESS
+          - KICK_TARGET_INVALID
+          - VALUE_NOT_NUMERIC
+          - RATE_LIMITED
+          - VALIDATION_FAILED
+          title: code
+          type: string
+        message:
+          title: message
+          type: string
+      required:
+      - code
+      - message
+      title: Error
+    JoinRequest:
+      description: New join.
+      properties:
+        name:
+          description: Profanity-filtered on the server.
+          maxLength: 24
+          minLength: 2
+          title: DisplayName
+          type: string
+      required:
+      - name
+      title: JoinRequest
+    RejoinRequest:
+      description: |
+        Rejoin with an existing seat token. Resolves the seat BEFORE
+        any new-join prohibition; permitted during AUTHOR, GUESS,
+        REVEAL, and VOTE. `name` is optional and ignored.
+      properties:
+        sessionToken:
+          description: The session token originally issued to this seat.
+          title: sessionToken
+          type: string
+        name:
+          description: Profanity-filtered on the server.
+          maxLength: 24
+          minLength: 2
+          title: DisplayName
+          type: string
+      required:
+      - sessionToken
+      title: RejoinRequest
+    JoinResponse:
+      example:
+        roomId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        roomCode: roomCode
+        playerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        sessionToken: sessionToken
+        isCreator: true
+        rejoined: false
+        phase: LOBBY
+        ttlExpiresAt: 2000-01-23T04:56:07.000+00:00
+        snapshotUrl: https://openapi-generator.tech
+      properties:
+        roomId:
+          format: uuid
+          title: roomId
+          type: string
+        roomCode:
+          pattern: "^[A-Z0-9]{4}$"
+          title: roomCode
+          type: string
+        playerId:
+          format: uuid
+          title: playerId
+          type: string
+        sessionToken:
+          description: |
+            Per-seat credential for X-Session-Token. The server stores
+            only its hash. Valid for rejoin within the grace period.
+          title: sessionToken
+          type: string
+        isCreator:
+          title: isCreator
+          type: boolean
+        rejoined:
+          default: false
+          title: rejoined
+          type: boolean
+        phase:
+          $ref: "#/components/schemas/Phase"
+        ttlExpiresAt:
+          format: date-time
+          title: ttlExpiresAt
+          type: string
+        snapshotUrl:
+          description: Present when phase is past LOBBY; a rejoining client should
+            fetch it immediately.
+          format: uri
+          title: snapshotUrl
+          type: string
+      required:
+      - phase
+      - playerId
+      - roomCode
+      - roomId
+      - sessionToken
+      - ttlExpiresAt
+      title: JoinResponse
+    RoomState:
+      example:
+        phase: LOBBY
+        players:
+        - playerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          name: name
+          isCreator: true
+          connected: true
+        - playerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          name: name
+          isCreator: true
+          connected: true
+        canStart: true
+        isCreator: true
+        ttlExpiresAt: 2000-01-23T04:56:07.000+00:00
+      properties:
+        phase:
+          $ref: "#/components/schemas/Phase"
+        players:
+          items:
+            $ref: "#/components/schemas/RoomState_players_inner"
+          title: players
+          type: array
+          default: null
+        canStart:
+          description: True only for the creator with 4-8 players.
+          title: canStart
+          type: boolean
+        isCreator:
+          title: isCreator
+          type: boolean
+        ttlExpiresAt:
+          format: date-time
+          title: ttlExpiresAt
+          type: string
+      required:
+      - canStart
+      - isCreator
+      - phase
+      - players
+      - ttlExpiresAt
+      title: RoomState
+    ReplayResponse:
+      example:
+        newRoomId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        newRoomCode: newRoomCode
+        seatClaimExpiresAt: 2000-01-23T04:56:07.000+00:00
+      properties:
+        newRoomId:
+          format: uuid
+          title: newRoomId
+          type: string
+        newRoomCode:
+          pattern: "^[A-Z0-9]{4}$"
+          title: newRoomCode
+          type: string
+        seatClaimExpiresAt:
+          description: |
+            Players (including the creator) claim seats in the new
+            room by POSTing to /rooms/{newRoomCode}/join with their
+            EXISTING session token before this time. Unclaimed seats
+            expire with the window.
+          format: date-time
+          title: seatClaimExpiresAt
+          type: string
+      required:
+      - newRoomCode
+      - newRoomId
+      - seatClaimExpiresAt
+      title: ReplayResponse
+    WsTicket:
+      example:
+        ticket: ticket
+        expiresAt: 2000-01-23T04:56:07.000+00:00
+      properties:
+        ticket:
+          description: Single-use; opens exactly one WebSocket.
+          title: ticket
+          type: string
+        expiresAt:
+          format: date-time
+          title: expiresAt
+          type: string
+      required:
+      - expiresAt
+      - ticket
+      title: WsTicket
+    PriceBand:
+      description: |
+        1 = under $15, 2 = $15–$60 (15.00 inclusive, exclusive at 60),
+        3 = $60–$200, 4 = over $200. Boundary rule: a price exactly ON
+        a boundary in dollars belongs to the HIGHER band. The ONLY
+        price information an author ever receives. Derived
+        server-side from the immutable price snapshot.
+      enum:
+      - 1
+      - 2
+      - 3
+      - 4
+      title: PriceBand
+      type: integer
+    AuthorCardView:
+      description: |
+        Author's secret view: image + price band ONLY. No title, no
+        description, no exact price, no review data.
+      example:
+        cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        imageUrl: https://openapi-generator.tech
+        priceBand: 6
+        deadlineAt: 2000-01-23T04:56:07.000+00:00
+        status: ASSIGNED
+        constraints:
+          titleMinChars: 1
+          titleMaxChars: 5
+          bulletMinChars: 5
+          bulletMaxChars: 2
+          bulletSlots: 7
+          starRatingMin: 9.301444243932576
+          starRatingMax: 3.616076749251911
+          starRatingStep: 2.027123023002322
+      properties:
+        cardId:
+          format: uuid
+          title: cardId
+          type: string
+        imageUrl:
+          description: Short-lived signed URL scoped to this player and the AUTHOR
+            phase window.
+          format: uri
+          title: imageUrl
+          type: string
+        priceBand:
+          $ref: "#/components/schemas/PriceBand"
+        deadlineAt:
+          format: date-time
+          title: deadlineAt
+          type: string
+        status:
+          $ref: "#/components/schemas/CardStatus"
+        constraints:
+          $ref: "#/components/schemas/AuthorCardView_constraints"
+      required:
+      - cardId
+      - constraints
+      - deadlineAt
+      - imageUrl
+      - priceBand
+      - status
+      title: AuthorCardView
+    AuthorCardSubmission:
+      description: |
+        Every field is individually optional to support the partial
+        submission rule. Bullets are 0–3 strings, each independently
+        optional — a two-bullet submission is valid and stored as a
+        two-item array.
+      example:
+        title: title
+        bullets:
+        - bullets
+        - bullets
+        - bullets
+        starRating: 4.607339274428313
+        reviewBucket: UNDER_10
+        category: category
+      properties:
+        title:
+          description: null or omitted = left blank.
+          maxLength: 60
+          minLength: 8
+          nullable: true
+          title: title
+          type: string
+        bullets:
+          description: |
+            0 to 3 bullet strings. Fewer than 3 is a valid partial
+            submission. null/omitted = no bullets.
+          items:
+            maxLength: 80
+            minLength: 15
+            type: string
+          maxItems: 3
+          nullable: true
+          title: bullets
+          type: array
+          default: null
+        starRating:
+          maximum: 5.0
+          minimum: 1.0
+          multipleOf: 0.5
+          nullable: true
+          title: starRating
+          type: number
+        reviewBucket:
+          enum:
+          - UNDER_10
+          - TEN_TO_99
+          - HUNDRED_TO_999
+          - THOUSAND_TO_9999
+          - TEN_THOUSAND_PLUS
+          - null
+          nullable: true
+          title: reviewBucket
+          type: string
+        category:
+          description: Slug from the ~12-category dropdown.
+          nullable: true
+          title: category
+          type: string
+      title: AuthorCardSubmission
+    AuthorCardStored:
+      allOf:
+      - $ref: "#/components/schemas/AuthorCardSubmission"
+      - properties:
+          cardId:
+            format: uuid
+            type: string
+          status:
+            $ref: "#/components/schemas/CardStatus"
+          submittedAt:
+            format: date-time
+            nullable: true
+            type: string
+        required:
+        - cardId
+        - status
+      example:
+        title: title
+        bullets:
+        - bullets
+        - bullets
+        - bullets
+        starRating: 1.3203312761844046
+        reviewBucket: UNDER_10
+        category: category
+        cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        status: ASSIGNED
+        submittedAt: 2000-01-23T04:56:07.000+00:00
+      title: AuthorCardStored
+    AuthorValidationError:
+      allOf:
+      - $ref: "#/components/schemas/Error"
+      - properties:
+          fieldErrors:
+            items:
+              $ref: "#/components/schemas/AuthorValidationError_allOf_fieldErrors"
+            type: array
+            default: null
+        required:
+        - fieldErrors
+      example:
+        code: ROOM_NOT_FOUND
+        message: message
+        fieldErrors:
+        - field: field
+          rule: TOO_SHORT
+          message: message
+        - field: field
+          rule: TOO_SHORT
+          message: message
+      title: AuthorValidationError
+    GuessQueue:
+      example:
+        cards:
+        - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          status: UNOPENED
+        - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          status: UNOPENED
+        myPosition:
+          activeCardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          nextCardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          allDone: true
+        progress:
+          myLocked: 1
+          myTimedOut: 1
+          myTotal: 6
+          allPlayersDone: true
+      properties:
+        cards:
+          description: |
+            Shuffled per THIS player. SUBMITTED cards only — skipped
+            cards are absent and not counted. Content access is still
+            gated by the open endpoint's state machine regardless of
+            which IDs a client holds.
+          items:
+            $ref: "#/components/schemas/GuessQueue_cards_inner"
+          title: cards
+          type: array
+          default: null
+        myPosition:
+          $ref: "#/components/schemas/GuessQueue_myPosition"
+        progress:
+          $ref: "#/components/schemas/GuessQueue_progress"
+      required:
+      - cards
+      - myPosition
+      - progress
+      title: GuessQueue
+    GuessCardView:
+      description: |
+        Drip-redacted card, valid for both the open response and
+        read-only GETs. ABSENT field = drip stage not reached;
+        `null` = stage reached but the author left the field blank.
+        This schema structurally cannot carry the image, original
+        title, original description, or true price — those fields do
+        not exist here.
+      example:
+        cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        status: null
+        openedAt: 2000-01-23T04:56:07.000+00:00
+        capAt: 2000-01-23T04:56:07.000+00:00
+        lockEligibleAt: 2000-01-23T04:56:07.000+00:00
+        title: title
+        category: category
+        bullets:
+        - bullets
+        - bullets
+        - bullets
+        starRating: 7.457744773683766
+        reviewBucket: UNDER_10
+        multiplierNow: 0.7351922275286783
+        draftValueCents: 4
+        sliderTouched: true
+        locked: true
+        lockedValueCents: 5
+      properties:
+        cardId:
+          format: uuid
+          title: cardId
+          type: string
+        status:
+          $ref: "#/components/schemas/GuessStatus"
+        openedAt:
+          format: date-time
+          title: openedAt
+          type: string
+        capAt:
+          description: openedAt + 20s hard cap; auto-lock fires then.
+          format: date-time
+          title: capAt
+          type: string
+        lockEligibleAt:
+          description: openedAt + 3s minimum dwell.
+          format: date-time
+          title: lockEligibleAt
+          type: string
+        title:
+          nullable: true
+          title: title
+          type: string
+        category:
+          nullable: true
+          title: category
+          type: string
+        bullets:
+          items:
+            nullable: true
+            type: string
+          maxItems: 3
+          title: bullets
+          type: array
+          default: null
+        starRating:
+          nullable: true
+          title: starRating
+          type: number
+        reviewBucket:
+          enum:
+          - UNDER_10
+          - TEN_TO_99
+          - HUNDRED_TO_999
+          - THOUSAND_TO_9999
+          - TEN_THOUSAND_PLUS
+          - null
+          nullable: true
+          title: reviewBucket
+          type: string
+        multiplierNow:
+          description: Live M(t) for the countdown ring.
+          maximum: 1.0
+          minimum: 0.7
+          title: multiplierNow
+          type: number
+        draftValueCents:
+          description: |
+            The server-known draft (last accepted PUT /draft value),
+            or null if never drafted. This is what auto-locks at cap
+            if the slider was touched.
+          nullable: true
+          title: draftValueCents
+          type: integer
+        sliderTouched:
+          title: sliderTouched
+          type: boolean
+        locked:
+          title: locked
+          type: boolean
+        lockedValueCents:
+          description: Present only when locked=true.
+          nullable: true
+          title: lockedValueCents
+          type: integer
+      required:
+      - capAt
+      - cardId
+      - draftValueCents
+      - lockEligibleAt
+      - multiplierNow
+      - openedAt
+      - sliderTouched
+      - status
+      title: GuessCardView
+    ValueInput:
+      example:
+        valueCents: 0
+      properties:
+        valueCents:
+          description: |
+            Numeric input. Out-of-range values are CLAMPED to
+            [100, 100000]; at/above $20.00 rounded to whole dollars.
+            Only non-numeric input is rejected.
+          title: valueCents
+          type: integer
+      required:
+      - valueCents
+      title: ValueInput
+    ValueEcho:
+      example:
+        valueCents: 0
+        formattedValue: formattedValue
+        wasClamped: true
+        wasRounded: true
+      properties:
+        valueCents:
+          title: valueCents
+          type: integer
+        formattedValue:
+          description: e.g. "$12.34" or "$127" (rounded form above $20).
+          title: formattedValue
+          type: string
+        wasClamped:
+          title: wasClamped
+          type: boolean
+        wasRounded:
+          title: wasRounded
+          type: boolean
+      required:
+      - formattedValue
+      - valueCents
+      - wasClamped
+      - wasRounded
+      title: ValueEcho
+    LockResponse:
+      allOf:
+      - $ref: "#/components/schemas/ValueEcho"
+      - description: |
+          No points field — points exist only on the server until
+          FINAL.
+        properties:
+          cardId:
+            format: uuid
+            type: string
+          lockedAt:
+            format: date-time
+            type: string
+          cardSeconds:
+            maximum: 20
+            minimum: 0
+            type: number
+          multiplier:
+            maximum: 1.0
+            minimum: 0.7
+            type: number
+          nextCardId:
+            description: Null when the queue is done.
+            format: uuid
+            nullable: true
+            type: string
+        required:
+        - cardId
+        - cardSeconds
+        - lockedAt
+        - multiplier
+      example:
+        valueCents: 0
+        formattedValue: formattedValue
+        wasClamped: true
+        wasRounded: true
+        cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        lockedAt: 2000-01-23T04:56:07.000+00:00
+        cardSeconds: 12.054912366140806
+        multiplier: 0.7439743894150883
+        nextCardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+      title: LockResponse
+    GameSnapshot:
+      description: |
+        The authoritative per-player state for reconnect/rejoin
+        recovery. Redaction is identical to the per-resource GETs.
+        Exactly one phase block is present, matching `phase`.
+      example:
+        roomId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        roomCode: roomCode
+        playerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        phase: LOBBY
+        seq: 0
+        lobby:
+          players:
+          - "{}"
+          - "{}"
+        author:
+          card:
+            cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            imageUrl: https://openapi-generator.tech
+            priceBand: 6
+            deadlineAt: 2000-01-23T04:56:07.000+00:00
+            status: ASSIGNED
+            constraints:
+              titleMinChars: 1
+              titleMaxChars: 5
+              bulletMinChars: 5
+              bulletMaxChars: 2
+              bulletSlots: 7
+              starRatingMin: 9.301444243932576
+              starRatingMax: 3.616076749251911
+              starRatingStep: 2.027123023002322
+          submitted: true
+          progress:
+            submitted: 4
+            skipped: 7
+            total: 1
+        guess:
+          queue:
+            cards:
+            - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              status: UNOPENED
+            - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              status: UNOPENED
+            myPosition:
+              activeCardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              nextCardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              allDone: true
+            progress:
+              myLocked: 1
+              myTimedOut: 1
+              myTotal: 6
+              allPlayersDone: true
+          activeCard:
+            cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            status: null
+            openedAt: 2000-01-23T04:56:07.000+00:00
+            capAt: 2000-01-23T04:56:07.000+00:00
+            lockEligibleAt: 2000-01-23T04:56:07.000+00:00
+            title: title
+            category: category
+            bullets:
+            - bullets
+            - bullets
+            - bullets
+            starRating: 7.457744773683766
+            reviewBucket: UNDER_10
+            multiplierNow: 0.7351922275286783
+            draftValueCents: 4
+            sliderTouched: true
+            locked: true
+            lockedValueCents: 5
+        reveal:
+          slideIndex: 9
+          slideCount: 9
+          slide:
+            slideIndex: 6
+            slideCount: 8
+            autoAdvanceAt: 2000-01-23T04:56:07.000+00:00
+            canAdvance: true
+            card:
+              cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              authorName: authorName
+              authored:
+                title: title
+                bullets:
+                - bullets
+                - bullets
+                - bullets
+                starRating: 4.607339274428313
+                reviewBucket: UNDER_10
+                category: category
+              original:
+                imageUrl: https://openapi-generator.tech
+                title: title
+                description: description
+                priceCents: 6
+                snapshotDate: 2000-01-23
+                category: category
+              guesses:
+              - playerName: playerName
+                valueCents: 3
+                lockedAt: 2000-01-23T04:56:07.000+00:00
+                cardSeconds: 6.965117697638846
+                timedOut: true
+              - playerName: playerName
+                valueCents: 3
+                lockedAt: 2000-01-23T04:56:07.000+00:00
+                cardSeconds: 6.965117697638846
+                timedOut: true
+              axisMinCents: 1
+              axisMaxCents: 2
+        vote:
+          options:
+            options:
+            - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              authorName: authorName
+              title: title
+              category: category
+              starRating: 6.778324963048013
+              reviewBucket: UNDER_10
+            - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              authorName: authorName
+              title: title
+              category: category
+              starRating: 6.778324963048013
+              reviewBucket: UNDER_10
+            deadlineAt: 2000-01-23T04:56:07.000+00:00
+            myVoteCast: true
+          myVoteCast: true
+          deadlineAt: 2000-01-23T04:56:07.000+00:00
+        final:
+          scoreboard:
+            endedReason: COMPLETED
+            winnerPlayerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            rankings:
+            - rank: 1
+              playerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              name: name
+              totalPoints: 5
+              breakdown:
+                guesserPoints: 6
+                authorPoints: 3
+                funniestBonus: 3
+              perCard:
+              - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+                role: GUESSER
+                status: UNOPENED
+                points: 7
+                accuracy: 0.8851374739011653
+                lockedAt: 2000-01-23T04:56:07.000+00:00
+                funniestVotes: 7
+              - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+                role: GUESSER
+                status: UNOPENED
+                points: 7
+                accuracy: 0.8851374739011653
+                lockedAt: 2000-01-23T04:56:07.000+00:00
+                funniestVotes: 7
+            - rank: 1
+              playerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              name: name
+              totalPoints: 5
+              breakdown:
+                guesserPoints: 6
+                authorPoints: 3
+                funniestBonus: 3
+              perCard:
+              - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+                role: GUESSER
+                status: UNOPENED
+                points: 7
+                accuracy: 0.8851374739011653
+                lockedAt: 2000-01-23T04:56:07.000+00:00
+                funniestVotes: 7
+              - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+                role: GUESSER
+                status: UNOPENED
+                points: 7
+                accuracy: 0.8851374739011653
+                lockedAt: 2000-01-23T04:56:07.000+00:00
+                funniestVotes: 7
+      properties:
+        roomId:
+          format: uuid
+          title: roomId
+          type: string
+        roomCode:
+          title: roomCode
+          type: string
+        playerId:
+          format: uuid
+          title: playerId
+          type: string
+        phase:
+          $ref: "#/components/schemas/Phase"
+        seq:
+          description: Current room event sequence (AsyncAPI); the client can detect
+            staleness against its last known seq.
+          title: seq
+          type: integer
+        lobby:
+          $ref: "#/components/schemas/GameSnapshot_lobby"
+        author:
+          $ref: "#/components/schemas/GameSnapshot_author"
+        guess:
+          $ref: "#/components/schemas/GameSnapshot_guess"
+        reveal:
+          $ref: "#/components/schemas/GameSnapshot_reveal"
+        vote:
+          $ref: "#/components/schemas/GameSnapshot_vote"
+        final:
+          $ref: "#/components/schemas/GameSnapshot_final"
+      required:
+      - phase
+      - playerId
+      - roomCode
+      - roomId
+      - seq
+      title: GameSnapshot
+    RevealSlide:
+      description: |
+        Original product next to the author's card, every guess as a
+        labeled dot on a shared log-scale axis. NO points on slides —
+        scores appear only in the final scoreboard.
+      example:
+        slideIndex: 6
+        slideCount: 8
+        autoAdvanceAt: 2000-01-23T04:56:07.000+00:00
+        canAdvance: true
+        card:
+          cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          authorName: authorName
+          authored:
+            title: title
+            bullets:
+            - bullets
+            - bullets
+            - bullets
+            starRating: 4.607339274428313
+            reviewBucket: UNDER_10
+            category: category
+          original:
+            imageUrl: https://openapi-generator.tech
+            title: title
+            description: description
+            priceCents: 6
+            snapshotDate: 2000-01-23
+            category: category
+          guesses:
+          - playerName: playerName
+            valueCents: 3
+            lockedAt: 2000-01-23T04:56:07.000+00:00
+            cardSeconds: 6.965117697638846
+            timedOut: true
+          - playerName: playerName
+            valueCents: 3
+            lockedAt: 2000-01-23T04:56:07.000+00:00
+            cardSeconds: 6.965117697638846
+            timedOut: true
+          axisMinCents: 1
+          axisMaxCents: 2
+      properties:
+        slideIndex:
+          title: slideIndex
+          type: integer
+        slideCount:
+          title: slideCount
+          type: integer
+        autoAdvanceAt:
+          format: date-time
+          title: autoAdvanceAt
+          type: string
+        canAdvance:
+          description: True only for the room creator.
+          title: canAdvance
+          type: boolean
+        card:
+          $ref: "#/components/schemas/RevealSlide_card"
+      required:
+      - autoAdvanceAt
+      - card
+      - slideCount
+      - slideIndex
+      title: RevealSlide
+    VoteOptions:
+      example:
+        options:
+        - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          authorName: authorName
+          title: title
+          category: category
+          starRating: 6.778324963048013
+          reviewBucket: UNDER_10
+        - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          authorName: authorName
+          title: title
+          category: category
+          starRating: 6.778324963048013
+          reviewBucket: UNDER_10
+        deadlineAt: 2000-01-23T04:56:07.000+00:00
+        myVoteCast: true
+      properties:
+        options:
+          description: SUBMITTED cards excluding the voter's own.
+          items:
+            $ref: "#/components/schemas/VoteOptions_options_inner"
+          title: options
+          type: array
+          default: null
+        deadlineAt:
+          description: |
+            Voting ends when all eligible players have voted or at
+            this deadline, whichever comes first. Non-voters record
+            no vote.
+          format: date-time
+          title: deadlineAt
+          type: string
+        myVoteCast:
+          title: myVoteCast
+          type: boolean
+      required:
+      - deadlineAt
+      - options
+      title: VoteOptions
+    FinalScoreboard:
+      example:
+        endedReason: COMPLETED
+        winnerPlayerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        rankings:
+        - rank: 1
+          playerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          name: name
+          totalPoints: 5
+          breakdown:
+            guesserPoints: 6
+            authorPoints: 3
+            funniestBonus: 3
+          perCard:
+          - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            role: GUESSER
+            status: UNOPENED
+            points: 7
+            accuracy: 0.8851374739011653
+            lockedAt: 2000-01-23T04:56:07.000+00:00
+            funniestVotes: 7
+          - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            role: GUESSER
+            status: UNOPENED
+            points: 7
+            accuracy: 0.8851374739011653
+            lockedAt: 2000-01-23T04:56:07.000+00:00
+            funniestVotes: 7
+        - rank: 1
+          playerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          name: name
+          totalPoints: 5
+          breakdown:
+            guesserPoints: 6
+            authorPoints: 3
+            funniestBonus: 3
+          perCard:
+          - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            role: GUESSER
+            status: UNOPENED
+            points: 7
+            accuracy: 0.8851374739011653
+            lockedAt: 2000-01-23T04:56:07.000+00:00
+            funniestVotes: 7
+          - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            role: GUESSER
+            status: UNOPENED
+            points: 7
+            accuracy: 0.8851374739011653
+            lockedAt: 2000-01-23T04:56:07.000+00:00
+            funniestVotes: 7
+      properties:
+        endedReason:
+          description: |
+            TOO_FEW_PLAYERS: a votekick dropped the room under 4;
+            only the cards completed by that point are included. The
+            client never infers how an interrupted game resolves.
+          enum:
+          - COMPLETED
+          - TOO_FEW_PLAYERS
+          title: endedReason
+          type: string
+        winnerPlayerId:
+          description: Null when endedReason is TOO_FEW_PLAYERS and too few cards
+            completed to rank.
+          format: uuid
+          nullable: true
+          title: winnerPlayerId
+          type: string
+        rankings:
+          items:
+            $ref: "#/components/schemas/FinalScoreboard_rankings_inner"
+          title: rankings
+          type: array
+          default: null
+      required:
+      - endedReason
+      - rankings
+      - winnerPlayerId
+      title: FinalScoreboard
+    ReportRequest:
+      description: |
+        Exactly one of reportedCardId / reportedPlayerId must be
+        present, and the target must belong to the reporter's room.
+      example:
+        roomCode: roomCode
+        reportedCardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        reportedPlayerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        reason: OFFENSIVE_CONTENT
+        note: note
+      properties:
+        roomCode:
+          pattern: "^[A-Z0-9]{4}$"
+          title: roomCode
+          type: string
+        reportedCardId:
+          format: uuid
+          title: reportedCardId
+          type: string
+        reportedPlayerId:
+          format: uuid
+          title: reportedPlayerId
+          type: string
+        reason:
+          enum:
+          - OFFENSIVE_CONTENT
+          - OFFENSIVE_NAME
+          - AFK
+          - OTHER
+          title: reason
+          type: string
+        note:
+          maxLength: 500
+          title: note
+          type: string
+      title: ReportRequest
+    ReportAdmin:
+      example:
+        id: 0
+        roomCode: roomCode
+        reportedCardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        reportedPlayerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        reporterPlayerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        reason: OFFENSIVE_CONTENT
+        note: note
+        status: OPEN
+        resolutionNote: resolutionNote
+        createdAt: 2000-01-23T04:56:07.000+00:00
+      properties:
+        id:
+          title: id
+          type: integer
+        roomCode:
+          title: roomCode
+          type: string
+        reportedCardId:
+          format: uuid
+          nullable: true
+          title: reportedCardId
+          type: string
+        reportedPlayerId:
+          format: uuid
+          nullable: true
+          title: reportedPlayerId
+          type: string
+        reporterPlayerId:
+          format: uuid
+          title: reporterPlayerId
+          type: string
+        reason:
+          enum:
+          - OFFENSIVE_CONTENT
+          - OFFENSIVE_NAME
+          - AFK
+          - OTHER
+          title: reason
+          type: string
+        note:
+          nullable: true
+          title: note
+          type: string
+        status:
+          enum:
+          - OPEN
+          - RESOLVED
+          - DISMISSED
+          title: status
+          type: string
+        resolutionNote:
+          nullable: true
+          title: resolutionNote
+          type: string
+        createdAt:
+          format: date-time
+          title: createdAt
+          type: string
+      required:
+      - createdAt
+      - id
+      - reason
+      - roomCode
+      - status
+      title: ReportAdmin
+    ProductAdmin:
+      description: |
+        ADMIN ONLY. Contains full product secrets. Images are
+        registered out of band by the ingestion pipeline; reference
+        them here by storage key.
+      example:
+        id: 0
+        imageStorageKey: imageStorageKey
+        originalTitle: originalTitle
+        originalDescription: originalDescription
+        priceCents: 30216
+        currency: USD
+        category: category
+        starRating: 1.586325192201178
+        reviewCount: 0
+        snapshotDate: 2000-01-23
+        priceBand: ""
+        active: true
+      properties:
+        id:
+          readOnly: true
+          title: id
+          type: integer
+        imageStorageKey:
+          description: "Format: products/{contentHash}.webp|jpg — must reference an\
+            \ already-registered image."
+          title: imageStorageKey
+          type: string
+        originalTitle:
+          maxLength: 512
+          title: originalTitle
+          type: string
+        originalDescription:
+          maxLength: 4096
+          title: originalDescription
+          type: string
+        priceCents:
+          description: Curated pool is $2–$500 (USD only).
+          maximum: 50000
+          minimum: 200
+          title: priceCents
+          type: integer
+        currency:
+          description: |
+            Fixed to USD. Slider range, price bands, and scoring all
+            assume USD; other currencies are rejected.
+          enum:
+          - USD
+          title: currency
+          type: string
+        category:
+          title: category
+          type: string
+        starRating:
+          maximum: 5.0
+          minimum: 1.0
+          nullable: true
+          title: starRating
+          type: number
+        reviewCount:
+          minimum: 0
+          nullable: true
+          title: reviewCount
+          type: integer
+        snapshotDate:
+          description: "Calendar date (date, not datetime), matching the reveal copy."
+          format: date
+          title: snapshotDate
+          type: string
+        priceBand:
+          allOf:
+          - $ref: "#/components/schemas/PriceBand"
+          description: Derived server-side from the immutable price.
+          readOnly: true
+          title: priceBand
+        active:
+          default: true
+          title: active
+          type: boolean
+      required:
+      - category
+      - imageStorageKey
+      - originalDescription
+      - originalTitle
+      - priceCents
+      - snapshotDate
+      title: ProductAdmin
+    _health_get_200_response:
+      example:
+        status: ok
+      properties:
+        status:
+          enum:
+          - ok
+          title: status
+          type: string
+      required:
+      - status
+      title: _health_get_200_response
+    _rooms_post_request:
+      properties:
+        name:
+          description: Profanity-filtered on the server.
+          maxLength: 24
+          minLength: 2
+          title: DisplayName
+          type: string
+      required:
+      - name
+      title: _rooms_post_request
+    _rooms__roomCode__join_post_request:
+      oneOf:
+      - $ref: "#/components/schemas/JoinRequest"
+      - $ref: "#/components/schemas/RejoinRequest"
+      title: _rooms__roomCode__join_post_request
+    _rooms__roomCode__start_post_202_response:
+      example:
+        phase: LOBBY
+        authorDeadlineAt: 2000-01-23T04:56:07.000+00:00
+      properties:
+        phase:
+          $ref: "#/components/schemas/Phase"
+        authorDeadlineAt:
+          format: date-time
+          title: deadlineAt
+          type: string
+      required:
+      - authorDeadlineAt
+      - phase
+      title: _rooms__roomCode__start_post_202_response
+    _games_current_vote_post_request:
+      properties:
+        cardId:
+          format: uuid
+          title: cardId
+          type: string
+      required:
+      - cardId
+      title: _games_current_vote_post_request
+    _rooms__roomCode__votekick_post_request:
+      properties:
+        targetPlayerId:
+          format: uuid
+          title: cardId
+          type: string
+        reason:
+          enum:
+          - OFFENSIVE_CONTENT
+          - AFK
+          title: reason
+          type: string
+      required:
+      - reason
+      - targetPlayerId
+      title: _rooms__roomCode__votekick_post_request
+    _rooms__roomCode__votekick_post_200_response:
+      example:
+        votesCast: 0
+        requiredVotes: 6
+        resolved: true
+      properties:
+        votesCast:
+          title: votesCast
+          type: integer
+        requiredVotes:
+          title: votesCast
+          type: integer
+        resolved:
+          description: True when the kick executed.
+          title: resolved
+          type: boolean
+      required:
+      - requiredVotes
+      - resolved
+      - votesCast
+      title: _rooms__roomCode__votekick_post_200_response
+    _admin_categories__slug__patch_request:
+      properties:
+        sigma:
+          description: Prior spread for scoring normalization.
+          maximum: 3.0
+          minimum: 0.05
+          title: sigma
+          type: number
+        active:
+          title: active
+          type: boolean
+      title: _admin_categories__slug__patch_request
+    _admin_reports__reportId__patch_request:
+      properties:
+        status:
+          enum:
+          - RESOLVED
+          - DISMISSED
+          title: status
+          type: string
+        resolutionNote:
+          maxLength: 1000
+          title: resolutionNote
+          type: string
+      required:
+      - status
+      title: _admin_reports__reportId__patch_request
+    RoomState_players_inner:
+      example:
+        playerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        name: name
+        isCreator: true
+        connected: true
+      properties:
+        playerId:
+          format: uuid
+          title: playerId
+          type: string
+        name:
+          description: Profanity-filtered on the server.
+          maxLength: 24
+          minLength: 2
+          title: DisplayName
+          type: string
+        isCreator:
+          title: isCreator
+          type: boolean
+        connected:
+          title: connected
+          type: boolean
+      required:
+      - connected
+      - isCreator
+      - name
+      - playerId
+      title: RoomState_players_inner
+    AuthorCardView_constraints:
+      description: Mirrored client-side for live inline validation.
+      example:
+        titleMinChars: 1
+        titleMaxChars: 5
+        bulletMinChars: 5
+        bulletMaxChars: 2
+        bulletSlots: 7
+        starRatingMin: 9.301444243932576
+        starRatingMax: 3.616076749251911
+        starRatingStep: 2.027123023002322
+      properties:
+        titleMinChars:
+          enum:
+          - 8
+          title: titleMinChars
+          type: integer
+        titleMaxChars:
+          enum:
+          - 60
+          title: titleMaxChars
+          type: integer
+        bulletMinChars:
+          enum:
+          - 15
+          title: bulletMinChars
+          type: integer
+        bulletMaxChars:
+          enum:
+          - 80
+          title: bulletMaxChars
+          type: integer
+        bulletSlots:
+          enum:
+          - 3
+          title: bulletSlots
+          type: integer
+        starRatingMin:
+          enum:
+          - 1.0
+          title: starRatingMin
+          type: number
+        starRatingMax:
+          enum:
+          - 5.0
+          title: starRatingMax
+          type: number
+        starRatingStep:
+          enum:
+          - 0.5
+          title: starRatingStep
+          type: number
+      title: AuthorCardView_constraints
+    AuthorValidationError_allOf_fieldErrors:
+      example:
+        field: field
+        rule: TOO_SHORT
+        message: message
+      properties:
+        field:
+          title: field
+          type: string
+        rule:
+          enum:
+          - TOO_SHORT
+          - TOO_LONG
+          - DIGITS_REJECTED
+          - NUMBER_WORD_REJECTED
+          - CURRENCY_SYMBOL_REJECTED
+          - PRICE_WORD_REJECTED
+          - PROFANITY_REJECTED
+          - BULLET_COUNT
+          - STAR_RATING_STEP
+          - CATEGORY_UNKNOWN
+          title: rule
+          type: string
+        message:
+          description: "Names the offending word for word-list rules, for inline display."
+          title: message
+          type: string
+      required:
+      - field
+      - message
+      - rule
+      title: AuthorValidationError_allOf_fieldErrors
+    GuessQueue_cards_inner:
+      example:
+        cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        status: UNOPENED
+      properties:
+        cardId:
+          format: uuid
+          title: cardId
+          type: string
+        status:
+          $ref: "#/components/schemas/GuessStatus"
+      required:
+      - cardId
+      - status
+      title: GuessQueue_cards_inner
+    GuessQueue_myPosition:
+      description: The server's authoritative queue position.
+      example:
+        activeCardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        nextCardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        allDone: true
+      properties:
+        activeCardId:
+          description: "The one active card, or null."
+          format: uuid
+          nullable: true
+          title: activeCardId
+          type: string
+        nextCardId:
+          format: uuid
+          nullable: true
+          title: nextCardId
+          type: string
+        allDone:
+          title: allDone
+          type: boolean
+      required:
+      - activeCardId
+      title: GuessQueue_myPosition
+    GuessQueue_progress:
+      description: Counts only — NEVER guess values.
+      example:
+        myLocked: 1
+        myTimedOut: 1
+        myTotal: 6
+        allPlayersDone: true
+      properties:
+        myLocked:
+          title: myLocked
+          type: integer
+        myTimedOut:
+          title: myTimedOut
+          type: integer
+        myTotal:
+          title: myTotal
+          type: integer
+        allPlayersDone:
+          title: allPlayersDone
+          type: boolean
+      required:
+      - allPlayersDone
+      - myLocked
+      - myTimedOut
+      - myTotal
+      title: GuessQueue_progress
+    GameSnapshot_lobby:
+      description: Present when phase is LOBBY.
+      example:
+        players:
+        - "{}"
+        - "{}"
+      properties:
+        players:
+          items:
+            type: object
+          title: players
+          type: array
+          default: null
+      title: GameSnapshot_lobby
+    GameSnapshot_author_progress:
+      example:
+        submitted: 4
+        skipped: 7
+        total: 1
+      properties:
+        submitted:
+          title: submitted
+          type: integer
+        skipped:
+          title: skipped
+          type: integer
+        total:
+          title: total
+          type: integer
+      title: GameSnapshot_author_progress
+    GameSnapshot_author:
+      description: Present when phase is AUTHOR.
+      example:
+        card:
+          cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          imageUrl: https://openapi-generator.tech
+          priceBand: 6
+          deadlineAt: 2000-01-23T04:56:07.000+00:00
+          status: ASSIGNED
+          constraints:
+            titleMinChars: 1
+            titleMaxChars: 5
+            bulletMinChars: 5
+            bulletMaxChars: 2
+            bulletSlots: 7
+            starRatingMin: 9.301444243932576
+            starRatingMax: 3.616076749251911
+            starRatingStep: 2.027123023002322
+        submitted: true
+        progress:
+          submitted: 4
+          skipped: 7
+          total: 1
+      properties:
+        card:
+          $ref: "#/components/schemas/AuthorCardView"
+        submitted:
+          title: submitted
+          type: boolean
+        progress:
+          $ref: "#/components/schemas/GameSnapshot_author_progress"
+      title: GameSnapshot_author
+    GameSnapshot_guess:
+      description: Present when phase is GUESS.
+      example:
+        queue:
+          cards:
+          - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            status: UNOPENED
+          - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            status: UNOPENED
+          myPosition:
+            activeCardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            nextCardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            allDone: true
+          progress:
+            myLocked: 1
+            myTimedOut: 1
+            myTotal: 6
+            allPlayersDone: true
+        activeCard:
+          cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          status: null
+          openedAt: 2000-01-23T04:56:07.000+00:00
+          capAt: 2000-01-23T04:56:07.000+00:00
+          lockEligibleAt: 2000-01-23T04:56:07.000+00:00
+          title: title
+          category: category
+          bullets:
+          - bullets
+          - bullets
+          - bullets
+          starRating: 7.457744773683766
+          reviewBucket: UNDER_10
+          multiplierNow: 0.7351922275286783
+          draftValueCents: 4
+          sliderTouched: true
+          locked: true
+          lockedValueCents: 5
+      properties:
+        queue:
+          $ref: "#/components/schemas/GuessQueue"
+        activeCard:
+          $ref: "#/components/schemas/GuessCardView"
+      title: GameSnapshot_guess
+    GameSnapshot_reveal:
+      description: Present when phase is REVEAL.
+      example:
+        slideIndex: 9
+        slideCount: 9
+        slide:
+          slideIndex: 6
+          slideCount: 8
+          autoAdvanceAt: 2000-01-23T04:56:07.000+00:00
+          canAdvance: true
+          card:
+            cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            authorName: authorName
+            authored:
+              title: title
+              bullets:
+              - bullets
+              - bullets
+              - bullets
+              starRating: 4.607339274428313
+              reviewBucket: UNDER_10
+              category: category
+            original:
+              imageUrl: https://openapi-generator.tech
+              title: title
+              description: description
+              priceCents: 6
+              snapshotDate: 2000-01-23
+              category: category
+            guesses:
+            - playerName: playerName
+              valueCents: 3
+              lockedAt: 2000-01-23T04:56:07.000+00:00
+              cardSeconds: 6.965117697638846
+              timedOut: true
+            - playerName: playerName
+              valueCents: 3
+              lockedAt: 2000-01-23T04:56:07.000+00:00
+              cardSeconds: 6.965117697638846
+              timedOut: true
+            axisMinCents: 1
+            axisMaxCents: 2
+      properties:
+        slideIndex:
+          title: slideIndex
+          type: integer
+        slideCount:
+          title: slideCount
+          type: integer
+        slide:
+          $ref: "#/components/schemas/RevealSlide"
+      required:
+      - slideCount
+      - slideIndex
+      title: GameSnapshot_reveal
+    GameSnapshot_vote:
+      description: Present when phase is VOTE.
+      example:
+        options:
+          options:
+          - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            authorName: authorName
+            title: title
+            category: category
+            starRating: 6.778324963048013
+            reviewBucket: UNDER_10
+          - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            authorName: authorName
+            title: title
+            category: category
+            starRating: 6.778324963048013
+            reviewBucket: UNDER_10
+          deadlineAt: 2000-01-23T04:56:07.000+00:00
+          myVoteCast: true
+        myVoteCast: true
+        deadlineAt: 2000-01-23T04:56:07.000+00:00
+      properties:
+        options:
+          $ref: "#/components/schemas/VoteOptions"
+        myVoteCast:
+          title: myVoteCast
+          type: boolean
+        deadlineAt:
+          format: date-time
+          title: deadlineAt
+          type: string
+      title: GameSnapshot_vote
+    GameSnapshot_final:
+      description: Present when phase is FINAL.
+      example:
+        scoreboard:
+          endedReason: COMPLETED
+          winnerPlayerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          rankings:
+          - rank: 1
+            playerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            name: name
+            totalPoints: 5
+            breakdown:
+              guesserPoints: 6
+              authorPoints: 3
+              funniestBonus: 3
+            perCard:
+            - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              role: GUESSER
+              status: UNOPENED
+              points: 7
+              accuracy: 0.8851374739011653
+              lockedAt: 2000-01-23T04:56:07.000+00:00
+              funniestVotes: 7
+            - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              role: GUESSER
+              status: UNOPENED
+              points: 7
+              accuracy: 0.8851374739011653
+              lockedAt: 2000-01-23T04:56:07.000+00:00
+              funniestVotes: 7
+          - rank: 1
+            playerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+            name: name
+            totalPoints: 5
+            breakdown:
+              guesserPoints: 6
+              authorPoints: 3
+              funniestBonus: 3
+            perCard:
+            - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              role: GUESSER
+              status: UNOPENED
+              points: 7
+              accuracy: 0.8851374739011653
+              lockedAt: 2000-01-23T04:56:07.000+00:00
+              funniestVotes: 7
+            - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+              role: GUESSER
+              status: UNOPENED
+              points: 7
+              accuracy: 0.8851374739011653
+              lockedAt: 2000-01-23T04:56:07.000+00:00
+              funniestVotes: 7
+      properties:
+        scoreboard:
+          $ref: "#/components/schemas/FinalScoreboard"
+      title: GameSnapshot_final
+    RevealSlide_card_original:
+      description: "Product secrets released HERE, for the first time, to everyone."
+      example:
+        imageUrl: https://openapi-generator.tech
+        title: title
+        description: description
+        priceCents: 6
+        snapshotDate: 2000-01-23
+        category: category
+      properties:
+        imageUrl:
+          format: uri
+          title: imageUrl
+          type: string
+        title:
+          title: title
+          type: string
+        description:
+          title: description
+          type: string
+        priceCents:
+          title: priceCents
+          type: integer
+        snapshotDate:
+          description: Calendar date for "snapshot price as of".
+          format: date
+          title: snapshotDate
+          type: string
+        category:
+          title: category
+          type: string
+      required:
+      - category
+      - description
+      - imageUrl
+      - priceCents
+      - snapshotDate
+      - title
+      title: RevealSlide_card_original
+    RevealSlide_card_guesses_inner:
+      example:
+        playerName: playerName
+        valueCents: 3
+        lockedAt: 2000-01-23T04:56:07.000+00:00
+        cardSeconds: 6.965117697638846
+        timedOut: true
+      properties:
+        playerName:
+          description: Profanity-filtered on the server.
+          maxLength: 24
+          minLength: 2
+          title: DisplayName
+          type: string
+        valueCents:
+          title: valueCents
+          type: integer
+        lockedAt:
+          format: date-time
+          title: lockedAt
+          type: string
+        cardSeconds:
+          description: Lock time for the t-dilemma story; null when auto-locked on
+            disconnect.
+          nullable: true
+          title: cardSeconds
+          type: number
+        timedOut:
+          description: True when locked by cap/disconnect rather than an explicit
+            player lock.
+          title: timedOut
+          type: boolean
+      required:
+      - lockedAt
+      - playerName
+      - valueCents
+      title: RevealSlide_card_guesses_inner
+    RevealSlide_card:
+      example:
+        cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        authorName: authorName
+        authored:
+          title: title
+          bullets:
+          - bullets
+          - bullets
+          - bullets
+          starRating: 4.607339274428313
+          reviewBucket: UNDER_10
+          category: category
+        original:
+          imageUrl: https://openapi-generator.tech
+          title: title
+          description: description
+          priceCents: 6
+          snapshotDate: 2000-01-23
+          category: category
+        guesses:
+        - playerName: playerName
+          valueCents: 3
+          lockedAt: 2000-01-23T04:56:07.000+00:00
+          cardSeconds: 6.965117697638846
+          timedOut: true
+        - playerName: playerName
+          valueCents: 3
+          lockedAt: 2000-01-23T04:56:07.000+00:00
+          cardSeconds: 6.965117697638846
+          timedOut: true
+        axisMinCents: 1
+        axisMaxCents: 2
+      properties:
+        cardId:
+          format: uuid
+          title: cardId
+          type: string
+        authorName:
+          description: Profanity-filtered on the server.
+          maxLength: 24
+          minLength: 2
+          title: DisplayName
+          type: string
+        authored:
+          $ref: "#/components/schemas/AuthorCardSubmission"
+        original:
+          $ref: "#/components/schemas/RevealSlide_card_original"
+        guesses:
+          description: |
+            Labeled dots in the server's animation order (dots
+            land one by one, ending on the true price).
+          items:
+            $ref: "#/components/schemas/RevealSlide_card_guesses_inner"
+          title: guesses
+          type: array
+          default: null
+        axisMinCents:
+          enum:
+          - 100
+          title: axisMinCents
+          type: integer
+        axisMaxCents:
+          enum:
+          - 100000
+          title: axisMaxCents
+          type: integer
+      required:
+      - authorName
+      - authored
+      - cardId
+      - guesses
+      - original
+      title: RevealSlide_card
+    VoteOptions_options_inner:
+      example:
+        cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        authorName: authorName
+        title: title
+        category: category
+        starRating: 6.778324963048013
+        reviewBucket: UNDER_10
+      properties:
+        cardId:
+          format: uuid
+          title: cardId
+          type: string
+        authorName:
+          description: Profanity-filtered on the server.
+          maxLength: 24
+          minLength: 2
+          title: DisplayName
+          type: string
+        title:
+          nullable: true
+          title: title
+          type: string
+        category:
+          nullable: true
+          title: category
+          type: string
+        starRating:
+          nullable: true
+          title: starRating
+          type: number
+        reviewBucket:
+          enum:
+          - UNDER_10
+          - TEN_TO_99
+          - HUNDRED_TO_999
+          - THOUSAND_TO_9999
+          - TEN_THOUSAND_PLUS
+          - null
+          nullable: true
+          title: reviewBucket
+          type: string
+      required:
+      - authorName
+      - cardId
+      - category
+      - title
+      title: VoteOptions_options_inner
+    FinalScoreboard_rankings_inner_breakdown:
+      example:
+        guesserPoints: 6
+        authorPoints: 3
+        funniestBonus: 3
+      properties:
+        guesserPoints:
+          description: Sum over every guessed card.
+          title: guesserPoints
+          type: integer
+        authorPoints:
+          title: authorPoints
+          type: integer
+        funniestBonus:
+          title: funniestBonus
+          type: integer
+      required:
+      - authorPoints
+      - funniestBonus
+      - guesserPoints
+      title: FinalScoreboard_rankings_inner_breakdown
+    FinalScoreboard_rankings_inner_perCard_inner:
+      example:
+        cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        role: GUESSER
+        status: UNOPENED
+        points: 7
+        accuracy: 0.8851374739011653
+        lockedAt: 2000-01-23T04:56:07.000+00:00
+        funniestVotes: 7
+      properties:
+        cardId:
+          format: uuid
+          title: cardId
+          type: string
+        role:
+          enum:
+          - GUESSER
+          - AUTHOR
+          title: role
+          type: string
+        status:
+          description: |
+            Per-role lifecycle, so zeros are
+            distinguishable from absence.
+          enum:
+          - UNOPENED
+          - IN_PROGRESS
+          - LOCKED
+          - TIMED_OUT
+          - SKIPPED
+          - ASSIGNED
+          - SUBMITTED
+          title: status
+          type: string
+        points:
+          title: points
+          type: integer
+        accuracy:
+          nullable: true
+          title: accuracy
+          type: number
+        lockedAt:
+          format: date-time
+          nullable: true
+          title: lockedAt
+          type: string
+        funniestVotes:
+          description: Author rows only.
+          nullable: true
+          title: funniestVotes
+          type: integer
+      required:
+      - cardId
+      - role
+      - status
+      title: FinalScoreboard_rankings_inner_perCard_inner
+    FinalScoreboard_rankings_inner:
+      example:
+        rank: 1
+        playerId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+        name: name
+        totalPoints: 5
+        breakdown:
+          guesserPoints: 6
+          authorPoints: 3
+          funniestBonus: 3
+        perCard:
+        - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          role: GUESSER
+          status: UNOPENED
+          points: 7
+          accuracy: 0.8851374739011653
+          lockedAt: 2000-01-23T04:56:07.000+00:00
+          funniestVotes: 7
+        - cardId: 046b6c7f-0b8a-43b9-b35d-6489e6daee91
+          role: GUESSER
+          status: UNOPENED
+          points: 7
+          accuracy: 0.8851374739011653
+          lockedAt: 2000-01-23T04:56:07.000+00:00
+          funniestVotes: 7
+      properties:
+        rank:
+          minimum: 1
+          title: rank
+          type: integer
+        playerId:
+          format: uuid
+          title: playerId
+          type: string
+        name:
+          description: Profanity-filtered on the server.
+          maxLength: 24
+          minLength: 2
+          title: DisplayName
+          type: string
+        totalPoints:
+          title: totalPoints
+          type: integer
+        breakdown:
+          $ref: "#/components/schemas/FinalScoreboard_rankings_inner_breakdown"
+        perCard:
+          items:
+            $ref: "#/components/schemas/FinalScoreboard_rankings_inner_perCard_inner"
+          title: perCard
+          type: array
+          default: null
+      required:
+      - breakdown
+      - name
+      - playerId
+      - rank
+      - totalPoints
+      title: FinalScoreboard_rankings_inner
+    inline_object:
+      allOf:
+      - $ref: "#/components/schemas/Error"
+      - properties:
+          phase:
+            $ref: "#/components/schemas/Phase"
+          retryInPhase:
+            description: "The phase in which this operation becomes valid, if any."
+            nullable: true
+            type: string
+      example:
+        code: ROOM_NOT_FOUND
+        message: message
+        phase: LOBBY
+        retryInPhase: retryInPhase
+      title: inline_object
+    inline_object_1_allOf_fieldErrors_inner:
+      example:
+        field: field
+        rule: TOO_SHORT
+      properties:
+        field:
+          title: field
+          type: string
+        rule:
+          enum:
+          - TOO_SHORT
+          - TOO_LONG
+          - DIGITS_REJECTED
+          - NUMBER_WORD_REJECTED
+          - CURRENCY_SYMBOL_REJECTED
+          - PRICE_WORD_REJECTED
+          - PROFANITY_REJECTED
+          - BULLET_COUNT
+          - STAR_RATING_STEP
+          - CATEGORY_UNKNOWN
+          - OUT_OF_RANGE
+          - EXACTLY_ONE_TARGET
+          - IMAGE_KEY_UNKNOWN
+          title: rule
+          type: string
+      required:
+      - field
+      - rule
+      title: inline_object_1_allOf_fieldErrors_inner
+    inline_object_1:
+      allOf:
+      - $ref: "#/components/schemas/Error"
+      - properties:
+          fieldErrors:
+            items:
+              $ref: "#/components/schemas/inline_object_1_allOf_fieldErrors_inner"
+            type: array
+            default: null
+      example:
+        code: ROOM_NOT_FOUND
+        message: message
+        fieldErrors:
+        - field: field
+          rule: TOO_SHORT
+        - field: field
+          rule: TOO_SHORT
+      title: inline_object_1
+  securitySchemes:
+    sessionToken:
+      description: |
+        Long-lived per-seat credential issued by create/join.
+        Authorizes exactly one player seat in exactly one room;
+        presenting it against any other room returns 403 WRONG_ROOM.
+        Never appears in URLs or query strings.
+      in: header
+      name: X-Session-Token
+      type: apiKey
+    adminAuth:
+      description: |
+        Separate administrative credential. Every /admin operation
+        explicitly requires THIS scheme (overriding the global player
+        scheme); a player session token must never satisfy it. A
+        player token presented as an admin bearer token fails 401.
+      scheme: bearer
+      type: http
