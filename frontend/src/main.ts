@@ -1,5 +1,5 @@
-
 import "./style.css";
+import { playSound } from "./sounds";
 
 type Phase = 0 | 1 | 2 | 3;
 
@@ -201,9 +201,10 @@ function phaseProgress() {
 }
 
 function header() {
+  return ""
   return `
     <header class="topbar">
-      <div class="brand">Price <span>Party</span></div>
+      <div class="brand">Bad <span>Retail</span></div>
     </header>
   `;
 }
@@ -255,7 +256,7 @@ function homeScreen() {
   return `
     <main class="main">
       <section class="lobby-controls" style="max-width:440px;margin:auto;height:100%;justify-content:center">
-        <h1 class="screen-title">Price Party</h1>
+        <h1 class="screen-title">Bad Retail</h1>
         <p class="screen-subtitle">
           A social guessing game. Create a lobby with your friends
           or join one that's already open.
@@ -950,6 +951,7 @@ app.addEventListener("submit", (event) => {
 app.addEventListener("input", (event) => {
   if (!(event.target instanceof HTMLInputElement)) return;
 
+  playSound("select");
   if (event.target.dataset.feature !== undefined) {
     submission.features[Number(event.target.dataset.feature)] = event.target.value;
   }
@@ -957,6 +959,8 @@ app.addEventListener("input", (event) => {
 
 app.addEventListener("click", async (event) => {
   if (!(event.target instanceof Element)) return;
+
+  playSound("click");
 
   const button = event.target.closest<HTMLButtonElement>("[data-action]");
   if (!button || button.disabled) return;
