@@ -15,12 +15,13 @@ dependencies.
 ## Run the API
 
 From `backend/`, synchronize dependencies and configure PostgreSQL. The defaults
-in `DATABASE_URL` expect the local database from `docker compose up -d db`.
-Set a non-empty `ADMIN_TOKEN` before starting the service.
+in `DATABASE_URL` expect the local database from the repo-root compose file
+(`docker compose up -d db`). Set a non-empty `ADMIN_TOKEN` before starting the
+service. For Supabase, S3 and the deployed topology, see `../DEPLOYMENT.md`.
 
 ```bash
 uv sync
-docker compose up -d db
+docker compose -f ../docker-compose.yaml up -d db
 export DATABASE_URL=postgresql+psycopg://impulsebuy:impulsebuy@localhost:5432/impulsebuy
 export ADMIN_TOKEN='replace-with-a-secret'
 PYTHONPATH=src uv run uvicorn openapi_server.main:app --host 0.0.0.0 --port 3000 --ws-ping-interval 15 --ws-ping-timeout 30
@@ -51,12 +52,18 @@ For the full Beauty metadata config, use `--config ingest.production.yaml`
 instead. That may download many product images; check storage capacity first.
 
 Prices are converted to cents and rows outside USD $2–$500 are skipped. Images
-are decoded and re-encoded as metadata-stripped WebP under
-`MEDIA_ROOT/products/` (default `media/products/`). The database stores
-`products/{content_hash}.webp` as the image storage key. Re-running the command
-does not reinsert a product image/content already present. The process needs
-network access to stream dataset metadata and download image URLs, and write
-access to `MEDIA_ROOT`.
+are decoded and re-encoded as metadata-stripped WebP, then written through the
+configured image backend: `MEDIA_BACKEND=local` stores them under
+`MEDIA_ROOT/products/` (default `media/products/`), and `MEDIA_BACKEND=s3`
+uploads them to an S3-compatible bucket (AWS S3, MinIO, R2, Supabase Storage).
+Either way the database stores `products/{content_hash}.webp` as the image
+storage key. Re-running the command does not reinsert a product image/content
+already present. The process needs network access to stream dataset metadata
+and download image URLs, and write access to the image backend.
+
+The signed image route serves local files directly and redirects to a
+short-lived presigned URL when a bucket is configured, so object bytes never
+transit the API.
 
 For offline development only, use the deterministic fixture seed (no ingest
 dependencies or Pillow needed):
@@ -71,9 +78,13 @@ download or claim production content.
 
 ## Running with Docker
 
+From the repository root (Postgres, MinIO, API and web):
+
 ```bash
 docker compose up --build
 ```
+
+`DEPLOYMENT.md` covers Supabase, S3, Vercel and container hosts.
 
 ## Tests
 

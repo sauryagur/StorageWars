@@ -18,6 +18,7 @@ from sqlmodel import SQLModel, Session, select
 
 from openapi_server.impl.config import settings
 from openapi_server.impl.db import engine, session_scope
+from openapi_server.impl.storage import Storage, StorageError, get_storage
 from openapi_server.impl.tables import Category, Product, ProductImage
 
 logger = logging.getLogger(__name__)
@@ -169,7 +170,7 @@ def _image_bytes(value: Any) -> bytes:
     raise ValueError("image value has no bytes, path, or URL")
 
 
-def _ingest(config: Mapping[str, Any], media_root: Path) -> tuple[int, int]:
+def _ingest(config: Mapping[str, Any], storage: Storage) -> tuple[int, int]:
     source = config.get("dataset", {}) or {}
     dataset_id = source.get("name")
     split = source.get("split")
@@ -214,11 +215,11 @@ def _ingest(config: Mapping[str, Any], media_root: Path) -> tuple[int, int]:
             if max_rows is not None and index >= int(max_rows):
                 break
             try:
-                if _ingest_record(session, row, mapping, config, media_root):
+                if _ingest_record(session, row, mapping, config, storage):
                     inserted += 1
                 else:
                     skipped += 1
-            except (ValueError, TypeError, OSError, InvalidOperation) as exc:
+            except (ValueError, TypeError, OSError, StorageError, InvalidOperation) as exc:
                 skipped += 1
                 logger.warning("Skipping dataset row %d: %s", index, exc)
     return inserted, skipped
@@ -271,7 +272,7 @@ def _ingest_record(
     row: Mapping[str, Any],
     mapping: Mapping[str, Any],
     config: Mapping[str, Any],
-    media_root: Path,
+    storage: Storage,
 ) -> bool:
     title = _text(_mapped_value(row, mapping.get("title"), required=True))
     description = _text(_mapped_value(row, mapping.get("description")))
@@ -308,10 +309,7 @@ def _ingest_record(
             ).first():
                 return False
         else:
-            target = media_root / storage_key
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists():
-                target.write_bytes(image_bytes)
+            storage.put(storage_key, image_bytes)
             product_image = ProductImage(
                 storage_key=storage_key,
                 content_hash=content_hash,
@@ -373,8 +371,7 @@ def _ingest_record(
 
 
 def _seed_fixtures_sync() -> tuple[int, int]:
-    media_root = Path(settings.media_root)
-    media_root.mkdir(parents=True, exist_ok=True)
+    storage = get_storage(settings)
     image_hash = hashlib.sha256(_FIXTURE_PNG).hexdigest()
     storage_key = f"products/{image_hash}.png"
     with session_scope() as session:
@@ -385,10 +382,7 @@ def _seed_fixtures_sync() -> tuple[int, int]:
             select(ProductImage).where(ProductImage.storage_key == storage_key)
         ).first()
         if image is None:
-            image_path = media_root / storage_key
-            image_path.parent.mkdir(parents=True, exist_ok=True)
-            if not image_path.exists():
-                image_path.write_bytes(_FIXTURE_PNG)
+            storage.put(storage_key, _FIXTURE_PNG)
             image = ProductImage(
                 storage_key=storage_key,
                 content_hash=image_hash,
@@ -463,7 +457,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     config = _read_config(Path(args.config))
-    inserted, skipped = _ingest(config, Path(settings.media_root))
+    inserted, skipped = _ingest(config, get_storage(settings))
     logger.info("Ingest complete: %d products inserted, %d skipped", inserted, skipped)
     return 0
 

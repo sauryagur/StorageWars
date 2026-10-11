@@ -5,6 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "openapi-server"
 version = "1.0.0"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115,<1",
@@ -14,6 +15,7 @@ dependencies = [
     "sqlmodel>=0.0.22,<1",
     "sqlalchemy>=2,<3",
     "psycopg[binary]>=3.2,<4",
+    "boto3>=1.35,<2",
     "websockets>=14,<16",
     "httpx>=0.28,<1",
     "pytest>=8,<9",
@@ -28,6 +30,10 @@ ingest = [
     "huggingface_hub>=0.27,<2",
     "Pillow>=11,<13",
 ]
+
+[tool.vercel]
+# `index.py` re-exports the ASGI app from `src/openapi_server/main.py`.
+entrypoint = "index:app"
 
 
 

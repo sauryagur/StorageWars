@@ -29,7 +29,7 @@ from enum import Enum as PyEnum
 from typing import Any, Optional
 from uuid import uuid4
 
-from sqlalchemy import JSON, Column, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, Column, UniqueConstraint
 from sqlmodel import Field, Relationship, SQLModel
 
 # --------------------------------------------------------------------------
@@ -375,7 +375,10 @@ class GameEvent(SQLModel, table=True):
 
     __tablename__ = "game_events"
 
-    id: Optional[int] = Field(default=None, primary_key=True)
+    # 63-bit content-addressed ids: must be BIGINT, not INTEGER (Postgres).
+    id: Optional[int] = Field(
+        default=None, sa_column=Column(BigInteger, primary_key=True)
+    )
     room_id: str = Field(foreign_key="room_records.id", index=True)
     event_type: GameEventType = Field(index=True)
     payload: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))

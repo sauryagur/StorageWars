@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from typing import Any
 
@@ -8,6 +9,8 @@ from openapi_server.impl.clock import Clock, get_clock
 from openapi_server.impl.config import settings
 from openapi_server.impl.errors import ApiError
 from openapi_server.impl.tables import hash_session_token
+
+logger = logging.getLogger(__name__)
 
 ROOM_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -246,6 +249,19 @@ class RoomRegistry:
         if self._sweeper is None or self._sweeper.done():
             self._sweeper = asyncio.create_task(self._sweep_loop())
         return self._sweeper
+
+    async def tick_all(self) -> None:
+        """Advance every live room once.
+
+        Serverless runtimes have no long-lived timer tasks, so each request
+        drives the clock instead of `RoomEngine.start_timers`. Failures are
+        logged per room: one broken room must not fail the request.
+        """
+        for room in tuple(self.rooms.values()):
+            try:
+                await room.tick()
+            except Exception:
+                logger.exception("tick failed for room %s", room.code)
 
     def reset(self) -> None:
         if self._sweeper:

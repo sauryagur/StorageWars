@@ -27,6 +27,7 @@ src/openapi_server/security_api.py
 tests/
 requirements.txt
 requirements-ingest.txt
+pyproject.toml
 Dockerfile
 docker-compose.yaml
 README.md

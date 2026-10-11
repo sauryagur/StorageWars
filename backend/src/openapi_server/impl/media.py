@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlmodel import select
 
 from openapi_server.impl.config import settings
 from openapi_server.impl.db import read
 from openapi_server.impl.products import verify_image_url
+from openapi_server.impl.storage import content_type_for, get_storage
 from openapi_server.impl.tables import ProductImage
 
 
@@ -24,17 +23,17 @@ async def media_route(
     )
     if image is None:
         raise HTTPException(status_code=404)
-    root = Path(settings.media_root).resolve()
-    path = (root / key).resolve()
-    if root not in path.parents or not path.is_file():
+    storage = get_storage(settings)
+    headers = {"Cache-Control": "private, max-age=60"}
+    signed = storage.presigned_url(key)
+    if signed is not None:
+        # Redirect to the object store: the bucket stays private, the redirect
+        # signature outlives only this request, and the bytes never transit the
+        # API. Scope still comes from the HMAC checked above.
+        return RedirectResponse(signed, status_code=307, headers=headers)
+    path = storage.local_path(key)
+    if path is None:
         raise HTTPException(status_code=404)
-    suffix = path.suffix.lower()
-    content_type = {
-        ".webp": "image/webp",
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-    }.get(suffix, "application/octet-stream")
     return FileResponse(
-        path, media_type=content_type, headers={"Cache-Control": "private, max-age=60"}
+        path, media_type=content_type_for(key), headers=headers
     )

@@ -1,0 +1,131 @@
+# Local full stack: Postgres + MinIO (S3-compatible image storage) + API + web.
+#
+#   docker compose up --build
+#     web        http://localhost:8080
+#     api        http://localhost:3000/v1/health
+#     minio      http://localhost:9001  (console)
+#     postgres   localhost:5432
+#
+# Point DATABASE_URL at Supabase to run the same stack against the cloud
+# database (see DEPLOYMENT.md), and set MEDIA_BACKEND=local to skip MinIO.
+name: impulsebuy
+
+x-api-environment: &api-environment
+  DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://impulsebuy:impulsebuy@db:5432/impulsebuy}
+  ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+  IMAGE_URL_SECRET: ${IMAGE_URL_SECRET:-dev-image-secret}
+  # Origin the browser uses for the API. Signed image URLs are built from it.
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+  CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:8080,http://localhost:5173,http://127.0.0.1:5173}
+  MEDIA_BACKEND: ${MEDIA_BACKEND:-s3}
+  MEDIA_ROOT: /app/media
+  S3_BUCKET: ${S3_BUCKET:-impulsebuy-media}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  # Internal address for uploads, published address for the presigned URL the
+  # browser follows.
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+  S3_PUBLIC_ENDPOINT_URL: ${S3_PUBLIC_ENDPOINT_URL:-http://localhost:9000}
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-impulsebuy}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-impulsebuy-secret}
+  S3_KEY_PREFIX: ${S3_KEY_PREFIX:-}
+  SEED_FIXTURES: ${SEED_FIXTURES:-1}
+  TIME_SCALE: ${TIME_SCALE:-1.0}
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-impulsebuy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-impulsebuy}
+      POSTGRES_DB: ${POSTGRES_DB:-impulsebuy}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-impulsebuy} -d ${POSTGRES_DB:-impulsebuy}
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "5432:5432"
+    volumes:
+      - impulsebuy_db:/var/lib/postgresql/data
+
+  minio:
+    # Local development stand-in for S3. Upstream MinIO stopped publishing to
+    # Docker Hub and quay.io refuses anonymous pulls, so this is the
+    # community-maintained fork. Production uses AWS S3 / Supabase Storage /
+    # R2 instead (see DEPLOYMENT.md).
+    image: pgsty/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-impulsebuy}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-impulsebuy-secret}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - impulsebuy_objects:/data
+
+  # Creates the private bucket the API uploads to, then exits.
+  storage-init:
+    build:
+      context: ./backend
+      target: service
+    depends_on:
+      - minio
+    environment: *api-environment
+    entrypoint:
+      - python
+      - scripts/create_bucket.py
+
+  api:
+    build:
+      context: ./backend
+      target: service
+    depends_on:
+      db:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    environment: *api-environment
+    ports:
+      - "3000:3000"
+    volumes:
+      # Only used when MEDIA_BACKEND=local.
+      - impulsebuy_media_files:/app/media
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/v1}
+        VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:8080/v1}
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+
+  # One-off catalog import. `docker compose --profile ingest run --rm ingest`
+  # (append `--config ingest.production.yaml` for the full 112k-row run).
+  ingest:
+    profiles: ["ingest"]
+    build:
+      context: ./backend
+      target: ingest
+    depends_on:
+      db:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    environment: *api-environment
+    command:
+      - python
+      - -m
+      - openapi_server.impl.ingest
+      - --config
+      - ingest.yaml
+
+volumes:
+  impulsebuy_db:
+  impulsebuy_objects:
+  impulsebuy_media_files:

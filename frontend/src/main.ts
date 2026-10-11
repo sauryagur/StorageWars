@@ -208,18 +208,23 @@ function startPolling() {
 }
 
 function websocketUrl(): string | null {
+  const roomCode = session.roomCode;
+  if (!roomCode) return null;
   const configured = (import.meta as ImportMeta & { env?: Record<string, string | undefined> })
     .env?.VITE_WS_URL;
-  if (configured) return configured;
-  try {
-    const base = new URL(api.baseUrl);
-    base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
-    // The spec defines the ticket endpoint but does not define a WebSocket
-    // path. Configure VITE_WS_URL when the backend uses a dedicated path.
-    return base.toString().replace(/\/$/, "");
-  } catch {
-    return null;
+  let base = configured?.trim();
+  if (!base) {
+    try {
+      const derived = new URL(api.baseUrl, window.location.href);
+      derived.protocol = derived.protocol === "https:" ? "wss:" : "ws:";
+      base = derived.toString();
+    } catch {
+      return null;
+    }
   }
+  // VITE_WS_URL is the API base (for example `wss://api.example.com/v1`); the
+  // room path is the same one the server registers.
+  return `${base.replace(/\/+$/, "")}/ws/${encodeURIComponent(roomCode.toUpperCase())}`;
 }
 
 function scheduleRealtimeReconnect() {

@@ -507,6 +507,11 @@ class RoomEngine:
         return min((item for item in deadlines if item is not None), default=None)
 
     def start_timers(self) -> None:
+        if settings.serverless:
+            # Function runtimes freeze between requests, so a room task would
+            # fire unpredictably. Requests are the only clock (`tick_all`), which
+            # also keeps a single tick source per room.
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:

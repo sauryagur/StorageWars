@@ -36,6 +36,24 @@ class Settings:
     time_scale: float = 1.0
     seed_fixtures: bool = False
     media_root: str = "media"
+    # Image storage. "local" writes under MEDIA_ROOT; "s3" uploads to an
+    # S3-compatible bucket (AWS S3, MinIO, R2, Supabase Storage) because
+    # serverless filesystems are read-only and ephemeral.
+    media_backend: str = "local"
+    s3_bucket: str = ""
+    s3_region: str = "us-east-1"
+    s3_endpoint_url: str = ""
+    s3_public_endpoint_url: str = ""
+    s3_access_key_id: str = ""
+    s3_secret_access_key: str = ""
+    s3_key_prefix: str = ""
+    s3_presign_ttl_seconds: int = 120
+    # Runtime shape. Vercel Functions are stateless and single-request, so the
+    # room sweeper is replaced by a tick on every request and the DB pool is
+    # sized for a pooler in front of Postgres.
+    serverless: bool = False
+    db_pool_size: int = 5
+    db_prepare_statements: bool = True
 
 
 def _int(name: str, default: int) -> int:
@@ -54,6 +72,14 @@ def get_settings() -> Settings:
     def seconds(name: str, default: float) -> float:
         """Real seconds a game-time duration lasts with this TIME_SCALE."""
         return _float(name, default) / scale
+
+    media_backend = os.getenv("MEDIA_BACKEND", "local").strip().lower()
+    if media_backend not in ("local", "s3"):
+        raise ValueError("MEDIA_BACKEND must be 'local' or 's3'")
+    s3_bucket = os.getenv("S3_BUCKET", "").strip()
+    if media_backend == "s3" and not s3_bucket:
+        raise ValueError("MEDIA_BACKEND=s3 requires S3_BUCKET")
+    serverless = bool(os.getenv("VERCEL"))
 
     return Settings(
         database_url=os.getenv("DATABASE_URL", Settings.database_url),
@@ -89,6 +115,21 @@ def get_settings() -> Settings:
         time_scale=scale,
         seed_fixtures=os.getenv("SEED_FIXTURES", "0") == "1",
         media_root=os.getenv("MEDIA_ROOT", "media"),
+        media_backend=media_backend,
+        s3_bucket=s3_bucket,
+        s3_region=os.getenv("S3_REGION", "us-east-1"),
+        s3_endpoint_url=os.getenv("S3_ENDPOINT_URL", "").strip(),
+        s3_public_endpoint_url=os.getenv("S3_PUBLIC_ENDPOINT_URL", "").strip(),
+        s3_access_key_id=os.getenv("S3_ACCESS_KEY_ID", "").strip(),
+        s3_secret_access_key=os.getenv("S3_SECRET_ACCESS_KEY", "").strip(),
+        s3_key_prefix=os.getenv("S3_KEY_PREFIX", "").strip().strip("/"),
+        s3_presign_ttl_seconds=max(1, _int("S3_PRESIGN_TTL_SECONDS", 120)),
+        serverless=serverless,
+        db_pool_size=max(1, _int("DB_POOL_SIZE", 1 if serverless else 5)),
+        db_prepare_statements=os.getenv(
+            "DB_PREPARE_STATEMENTS", "0" if serverless else "1"
+        )
+        == "1",
     )
 
 
