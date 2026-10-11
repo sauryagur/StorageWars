@@ -21,3 +21,12 @@
 #docs/*.md
 # Then explicitly reverse the ignore rule for a single file:
 #!docs/README.md
+src/openapi_server/impl/
+src/openapi_server/main.py
+src/openapi_server/security_api.py
+tests/
+requirements.txt
+requirements-ingest.txt
+Dockerfile
+docker-compose.yaml
+README.md

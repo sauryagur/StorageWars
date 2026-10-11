@@ -1,58 +1,31 @@
-# coding: utf-8
-
-from fastapi.testclient import TestClient
+from conftest import auth, create_room, join_player
 
 
-from pydantic import Field, field_validator  # noqa: F401
-from typing import Any  # noqa: F401
-from typing_extensions import Annotated  # noqa: F401
-from openapi_server.models.error import Error  # noqa: F401
-from openapi_server.models.inline_object1 import InlineObject1  # noqa: F401
-from openapi_server.models.report_request import ReportRequest  # noqa: F401
-from openapi_server.models.rooms_room_code_votekick_post200_response import RoomsRoomCodeVotekickPost200Response  # noqa: F401
-from openapi_server.models.rooms_room_code_votekick_post_request import RoomsRoomCodeVotekickPostRequest  # noqa: F401
-
-
-def test_reports_post(client: TestClient):
-    """Test case for reports_post
-
-    Report a card or a player
-    """
-    report_request = openapi_server.ReportRequest()
-
-    headers = {
-        "sessionToken": "special-key",
-    }
-    # uncomment below to make a request
-    #response = client.request(
-    #    "POST",
-    #    "/reports",
-    #    headers=headers,
-    #    json=report_request,
-    #)
-
-    # uncomment below to assert the status code of the HTTP response
-    #assert response.status_code == 200
-
-
-def test_rooms_room_code_votekick_post(client: TestClient):
-    """Test case for rooms_room_code_votekick_post
-
-    Cast a votekick vote (idempotent)
-    """
-    rooms_room_code_votekick_post_request = openapi_server.RoomsRoomCodeVotekickPostRequest()
-
-    headers = {
-        "sessionToken": "special-key",
-    }
-    # uncomment below to make a request
-    #response = client.request(
-    #    "POST",
-    #    "/rooms/{roomCode}/votekick".format(roomCode='room_code_example'),
-    #    headers=headers,
-    #    json=rooms_room_code_votekick_post_request,
-    #)
-
-    # uncomment below to assert the status code of the HTTP response
-    #assert response.status_code == 200
-
+def test_report_requires_exactly_one_target_and_accepts_room_player(client):
+    host = create_room(client)
+    guest = join_player(client, host["roomCode"], "Guest player")
+    neither = client.post(
+        "/v1/reports", headers=auth(host["sessionToken"]), json={"reason": "OTHER"}
+    )
+    assert neither.status_code == 422
+    assert neither.json()["code"] == "EXACTLY_ONE_TARGET"
+    both = client.post(
+        "/v1/reports",
+        headers=auth(host["sessionToken"]),
+        json={
+            "reportedPlayerId": guest["playerId"],
+            "reportedCardId": "00000000-0000-0000-0000-000000000001",
+            "reason": "OTHER",
+        },
+    )
+    assert both.status_code == 422
+    valid = client.post(
+        "/v1/reports",
+        headers=auth(host["sessionToken"]),
+        json={
+            "reportedPlayerId": guest["playerId"],
+            "reason": "AFK",
+            "note": "Disconnected",
+        },
+    )
+    assert valid.status_code == 202, valid.text

@@ -112,7 +112,7 @@ async def rooms_room_code_get(
     responses={
         202: {"model": RoomsRoomCodeStartPost202Response, "description": "Game started; room in AUTHOR."},
         403: {"model": Error, "description": "Not the room creator, token not bound to this room (WRONG_ROOM), or action forbidden for this seat. "},
-        409: {"model": Error, "description": "Fewer than 4 players, or game in progress."},
+        409: {"model": Error, "description": "Fewer than 2 players, or game in progress."},
     },
     tags=["Rooms"],
     summary="Start the game (creator only)",

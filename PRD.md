@@ -8,7 +8,7 @@ Impulse Buy is a mobile-first multiplayer party game where players describe a pr
 
 - **Audience:** friend groups, in the same room or on Discord voice.
 - **Platform:** mobile web. Players join with a 4-character room code, with no install and no account.
-- **Session size:** 4 to 8 players. Every player authors exactly one card and guesses on every other card.
+- **Session size:** 2 to 8 players. Every player authors exactly one card and guesses on every other card.
 - **Session length:** about 4 minutes with 4 players and about 7 minutes with 8.
 - **Rooms:** private rooms only in v1. Friends play on an honor system, and the design makes cheating unprofitable instead of trying to police it.
 
@@ -211,7 +211,7 @@ Every screen is designed for a phone in portrait while the player is on a voice 
 
 | Screen               | Shown to | Key elements                                                                                                    |
 | -------------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
-| Lobby                | All      | Room code, player list, start button for the room creator (4 to 8 players)                                      |
+| Lobby                | All      | Room code, player list, start button for the room creator (2 to 8 players)                                      |
 | Author               | All      | Image, price band, form with live validation, countdown                                                         |
 | Waiting for authors  | All      | Progress indicator                                                                                              |
 | Guess                | All      | Redacted card layout, countdown ring with live multiplier, slider, nudge buttons, numeric fallback, Lock button |

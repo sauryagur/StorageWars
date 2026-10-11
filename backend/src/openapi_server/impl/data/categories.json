@@ -1,0 +1,14 @@
+[
+  {"slug":"home-kitchen","display_name":"Home & Kitchen"},
+  {"slug":"electronics","display_name":"Electronics"},
+  {"slug":"beauty","display_name":"Beauty & Personal Care"},
+  {"slug":"sports-outdoors","display_name":"Sports & Outdoors"},
+  {"slug":"toys-games","display_name":"Toys & Games"},
+  {"slug":"clothing","display_name":"Clothing & Accessories"},
+  {"slug":"tools","display_name":"Tools & Home Improvement"},
+  {"slug":"office","display_name":"Office Products"},
+  {"slug":"garden","display_name":"Garden & Patio"},
+  {"slug":"pets","display_name":"Pet Supplies"},
+  {"slug":"automotive","display_name":"Automotive"},
+  {"slug":"food","display_name":"Grocery & Gourmet Food"}
+]

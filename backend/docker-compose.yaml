@@ -1,9 +1,30 @@
-version: '3.6'
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: impulsebuy
+      POSTGRES_PASSWORD: impulsebuy
+      POSTGRES_DB: impulsebuy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U impulsebuy -d impulsebuy"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - impulsebuy_db:/var/lib/postgresql/data
   service:
     build:
       context: .
       target: service
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://impulsebuy:impulsebuy@db:5432/impulsebuy
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-change-me}
+      IMAGE_URL_SECRET: ${IMAGE_URL_SECRET:-change-me}
     ports:
-      - "8080:8080"
-    command: uvicorn openapi_server.main:app --host 0.0.0.0 --port 8080
+      - "3000:3000"
+    command: uvicorn openapi_server.main:app --host 0.0.0.0 --port 3000 --ws-ping-interval 15 --ws-ping-timeout 30
+volumes:
+  impulsebuy_db:

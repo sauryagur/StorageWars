@@ -198,7 +198,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-          description: "Fewer than 4 players, or game in progress."
+          description: "Fewer than 2 players, or game in progress."
       summary: Start the game (creator only)
       tags:
       - Rooms

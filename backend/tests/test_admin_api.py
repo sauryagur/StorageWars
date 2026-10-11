@@ -1,122 +1,116 @@
-# coding: utf-8
+import pytest
 
-from fastapi.testclient import TestClient
+from dataclasses import replace
 
-
-from pydantic import Field, field_validator  # noqa: F401
-from typing import Any, List, Optional  # noqa: F401
-from typing_extensions import Annotated  # noqa: F401
-from openapi_server.models.admin_categories_slug_patch_request import AdminCategoriesSlugPatchRequest  # noqa: F401
-from openapi_server.models.admin_reports_report_id_patch_request import AdminReportsReportIdPatchRequest  # noqa: F401
-from openapi_server.models.inline_object1 import InlineObject1  # noqa: F401
-from openapi_server.models.product_admin import ProductAdmin  # noqa: F401
-from openapi_server.models.report_admin import ReportAdmin  # noqa: F401
+from conftest import auth, create_room
 
 
-def test_admin_products_get(client: TestClient):
-    """Test case for admin_products_get
-
-    List products (full secrets)
-    """
-    params = [("active", True),     ("category", 'category_example'),     ("price_band", 56)]
-    headers = {
-        "Authorization": "Bearer special-key",
-    }
-    # uncomment below to make a request
-    #response = client.request(
-    #    "GET",
-    #    "/admin/products",
-    #    headers=headers,
-    #    params=params,
-    #)
-
-    # uncomment below to assert the status code of the HTTP response
-    #assert response.status_code == 200
+def _admin_headers():
+    return {"Authorization": "Bearer test-admin-secret"}
 
 
-def test_admin_products_post(client: TestClient):
-    """Test case for admin_products_post
+def test_admin_auth_product_filters_unknown_image_and_report_resolution(
+    client, monkeypatch
+):
+    from openapi_server import security_api
+    from openapi_server.impl import content
+    from openapi_server.impl.config import settings
 
-    Create a product
-    """
-    product_admin = openapi_server.ProductAdmin()
+    denied = client.get(
+        "/v1/admin/products", headers={"Authorization": "Bearer player-token"}
+    )
+    assert denied.status_code == 401
+    assert denied.content == b""
+    monkeypatch.setattr(
+        security_api, "settings", replace(settings, admin_token="test-admin-secret")
+    )
+    headers = _admin_headers()
+    products = client.get("/v1/admin/products", headers=headers)
+    assert products.status_code == 200 and len(products.json()) >= 24
+    first = products.json()[0]
+    band_filter = client.get(
+        f"/v1/admin/products?priceBand={first['priceBand']}", headers=headers
+    )
+    assert band_filter.status_code == 200 and band_filter.json()
+    assert all(item["priceBand"] == first["priceBand"] for item in band_filter.json())
+    active_filter = client.get(
+        "/v1/admin/products?active=true&category=home-kitchen", headers=headers
+    )
+    assert active_filter.status_code == 200
+    assert all(
+        item["active"] is True and item["category"] == "home-kitchen"
+        for item in active_filter.json()
+    )
 
-    headers = {
-        "Authorization": "Bearer special-key",
-    }
-    # uncomment below to make a request
-    #response = client.request(
-    #    "POST",
-    #    "/admin/products",
-    #    headers=headers,
-    #    json=product_admin,
-    #)
+    unknown_image = client.post(
+        "/v1/admin/products",
+        headers=headers,
+        json={
+            "imageStorageKey": "products/not-registered.webp",
+            "originalTitle": "Admin-created product",
+            "originalDescription": "A test catalog entry.",
+            "priceCents": 5999,
+            "currency": "USD",
+            "category": "home-kitchen",
+            "snapshotDate": "2026-01-01",
+        },
+    )
+    assert unknown_image.status_code == 422
+    assert unknown_image.json()["code"] == "IMAGE_KEY_UNKNOWN"
 
-    # uncomment below to assert the status code of the HTTP response
-    #assert response.status_code == 200
+    room = create_room(client)
+    report = client.post(
+        "/v1/reports",
+        headers=auth(room["sessionToken"]),
+        json={
+            "reportedPlayerId": room["playerId"],
+            "reason": "OTHER",
+            "note": "Review this report",
+        },
+    )
+    assert report.status_code == 202, report.text
+    opened = client.get("/v1/admin/reports?status=OPEN", headers=headers)
+    assert opened.status_code == 200 and len(opened.json()) == 1
+    row = opened.json()[0]
+    resolved = client.patch(
+        f"/v1/admin/reports/{row['id']}",
+        headers=headers,
+        json={
+            "status": "RESOLVED",
+            "resolutionNote": "Reviewed and resolved",
+        },
+    )
+    assert resolved.status_code == 200, resolved.text
+    resolved_list = client.get("/v1/admin/reports?status=RESOLVED", headers=headers)
+    assert len(resolved_list.json()) == 1
+    assert resolved_list.json()[0]["resolutionNote"] == "Reviewed and resolved"
 
+    import asyncio
+    import math
+    from types import SimpleNamespace
+    from openapi_server.impl.engine.registry import registry
+    from openapi_server.impl.engine.room import Guess
 
-def test_admin_categories_slug_patch(client: TestClient):
-    """Test case for admin_categories_slug_patch
+    product = SimpleNamespace(
+        price_cents=10_000,
+        category=SimpleNamespace(slug="home-kitchen", sigma=0.5),
+    )
+    active_room, creator, _ = registry.create_room("Active Room")
+    active_room.add_player("Active Guest")
+    active_room.add_player("Another Guest")
+    active_room.add_player("Last Guest")
+    active_room.start([product, product, product, product], creator.id)
+    active_card = next(iter(active_room.cards.values()))
 
-    Tune a category (sigma)
-    """
-    admin_categories_slug_patch_request = openapi_server.AdminCategoriesSlugPatchRequest()
-
-    headers = {
-        "Authorization": "Bearer special-key",
-    }
-    # uncomment below to make a request
-    #response = client.request(
-    #    "PATCH",
-    #    "/admin/categories/{slug}".format(slug='slug_example'),
-    #    headers=headers,
-    #    json=admin_categories_slug_patch_request,
-    #)
-
-    # uncomment below to assert the status code of the HTTP response
-    #assert response.status_code == 200
-
-
-def test_admin_reports_get(client: TestClient):
-    """Test case for admin_reports_get
-
-    List reports for review
-    """
-    params = [("status", 'status_example')]
-    headers = {
-        "Authorization": "Bearer special-key",
-    }
-    # uncomment below to make a request
-    #response = client.request(
-    #    "GET",
-    #    "/admin/reports",
-    #    headers=headers,
-    #    params=params,
-    #)
-
-    # uncomment below to assert the status code of the HTTP response
-    #assert response.status_code == 200
-
-
-def test_admin_reports_report_id_patch(client: TestClient):
-    """Test case for admin_reports_report_id_patch
-
-    Resolve or dismiss a report
-    """
-    admin_reports_report_id_patch_request = openapi_server.AdminReportsReportIdPatchRequest()
-
-    headers = {
-        "Authorization": "Bearer special-key",
-    }
-    # uncomment below to make a request
-    #response = client.request(
-    #    "PATCH",
-    #    "/admin/reports/{reportId}".format(reportId=56),
-    #    headers=headers,
-    #    json=admin_reports_report_id_patch_request,
-    #)
-
-    # uncomment below to assert the status code of the HTTP response
-    #assert response.status_code == 200
-
+    patch = client.patch(
+        "/v1/admin/categories/home-kitchen", headers=headers, json={"sigma": 0.8}
+    )
+    assert patch.status_code == 200, patch.text
+    assert active_card.product.category.sigma == 0.8
+    guess = Guess(creator.id, value_cents=round(product.price_cents * math.exp(0.25)))
+    active_room._score_guess(guess, active_card)
+    assert guess.z == pytest.approx(
+        abs(math.log(guess.value_cents / product.price_cents)) / 0.8
+    )
+    categories = asyncio.run(content.load_categories())
+    assert next(item for item in categories if item.slug == "home-kitchen").sigma == 0.8
