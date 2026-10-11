@@ -1,0 +1,30 @@
+# Full Amazon Reviews 2023 Beauty metadata import. This is intentionally
+# unbounded; review storage and image downloads before running against production.
+dataset:
+  name: "McAuley-Lab/Amazon-Reviews-2023"
+  config_name: "raw_meta_All_Beauty"
+  format: parquet
+  data_files: "https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023/resolve/2b6d039ed471f2ba5fd2acb718bf33b0a7e5598e/raw_meta_All_Beauty/full-00000-of-00001.parquet"
+  split: train
+  streaming: true
+
+# Exact columns from raw_meta_All_Beauty.
+columns:
+  title: "title"
+  description: "description"
+  price: "price"
+  image: "images"
+  category: "main_category"
+  rating: "average_rating"
+  review_count: "rating_number"
+  snapshot_date: ""
+
+# Source prices are USD strings; price_multiplier is applied before conversion.
+price_unit: dollars
+price_multiplier: 1
+
+category_map:
+  All Beauty:
+    slug: beauty
+    display_name: Beauty & Personal Care
+default_category_slug: beauty

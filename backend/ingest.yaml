@@ -7,8 +7,8 @@ dataset:
   data_files: "https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023/resolve/2b6d039ed471f2ba5fd2acb718bf33b0a7e5598e/raw_meta_All_Beauty/full-00000-of-00001.parquet"
   split: train
   streaming: true
-  # Keep bootstrap bounded; raise/remove after validating storage and image throughput.
-  max_rows: 1000
+  # Small real-dataset sample for development; unit tests use fixtures.
+  max_rows: 20
 
 # Exact columns from raw_meta_All_Beauty.
 columns:

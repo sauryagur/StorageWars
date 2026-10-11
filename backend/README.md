@@ -31,21 +31,24 @@ Interactive API documentation is available at `http://localhost:3000/docs`.
 
 ## Product content
 
-`ingest.yaml` uses the [Amazon Reviews 2023 dataset](https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023), `raw_meta_All_Beauty` config. It reads the published, pinned Parquet export with the `train` split; the export contains 112,590 records. This avoids executing the dataset's legacy Python loader script, which current `datasets` versions reject. The initial import is intentionally bounded to the first 1,000 rows (`dataset.max_rows`) and streams records; it is a Beauty & Personal Care bootstrap, not the entire Amazon catalog. Raise or remove `max_rows` only after estimating database, media-storage, and image-download capacity. Review records are not imported.
+`ingest.yaml` is a 20-row real-data smoke config for Amazon Reviews 2023
+`raw_meta_All_Beauty`; the normal test suite stays offline and uses fixtures.
+`ingest.production.yaml` uses the same pinned public Parquet file with no row
+limit (112,590 source records), but it covers Beauty & Personal Care only—not
+all Amazon categories. Both configs map the published `title`, `description`,
+`price`, `images`, `main_category`, `average_rating`, and `rating_number`
+fields. No Hugging Face token/key is required for this public dataset.
 
-The column mapping matches the published metadata schema: `title`, `description`,
-`price`, `images`, `main_category`, `average_rating`, and `rating_number`.
-Descriptions are joined from their string-list values. The first available image
-is chosen in `hi_res`, `large`, then `thumb` order. `main_category` maps to the
-backend `beauty` category. To use another metadata config, update `dataset.config_name`
-and point `dataset.data_files` at that config's Parquet export.
+Run the small dataset smoke import after the database has been initialized:
 
-Run the import from `backend/` after the database is initialized:
-
-```bash
+```powershell
 uv sync --extra ingest
-PYTHONPATH=src uv run --extra ingest python -m openapi_server.impl.ingest --config ingest.yaml
+$env:PYTHONPATH = "src"
+uv run --extra ingest python -m openapi_server.impl.ingest --config ingest.yaml
 ```
+
+For the full Beauty metadata config, use `--config ingest.production.yaml`
+instead. That may download many product images; check storage capacity first.
 
 Prices are converted to cents and rows outside USD $2–$500 are skipped. Images
 are decoded and re-encoded as metadata-stripped WebP under
