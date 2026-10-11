@@ -1,50 +1,12 @@
-# coding: utf-8
-
-from fastapi.testclient import TestClient
+from conftest import auth, create_room
 
 
-from typing import Any  # noqa: F401
-from openapi_server.models.error import Error  # noqa: F401
-from openapi_server.models.inline_object import InlineObject  # noqa: F401
-from openapi_server.models.reveal_slide import RevealSlide  # noqa: F401
-
-
-def test_games_current_reveal_get(client: TestClient):
-    """Test case for games_current_reveal_get
-
-    Current reveal slide
-    """
-
-    headers = {
-        "sessionToken": "special-key",
-    }
-    # uncomment below to make a request
-    #response = client.request(
-    #    "GET",
-    #    "/games/current/reveal",
-    #    headers=headers,
-    #)
-
-    # uncomment below to assert the status code of the HTTP response
-    #assert response.status_code == 200
-
-
-def test_games_current_reveal_advance_post(client: TestClient):
-    """Test case for games_current_reveal_advance_post
-
-    Advance the carousel early (creator only)
-    """
-
-    headers = {
-        "sessionToken": "special-key",
-    }
-    # uncomment below to make a request
-    #response = client.request(
-    #    "POST",
-    #    "/games/current/reveal/advance",
-    #    headers=headers,
-    #)
-
-    # uncomment below to assert the status code of the HTTP response
-    #assert response.status_code == 200
-
+def test_reveal_and_final_are_phase_guarded(client):
+    host = create_room(client)
+    reveal = client.get("/v1/games/current/reveal", headers=auth(host["sessionToken"]))
+    assert reveal.status_code == 409
+    assert reveal.json()["code"] == "WRONG_PHASE"
+    assert reveal.json()["phase"] == "LOBBY"
+    final = client.get("/v1/games/current/final", headers=auth(host["sessionToken"]))
+    assert final.status_code == 409
+    assert final.json()["code"] == "WRONG_PHASE"

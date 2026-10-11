@@ -1,30 +1,9 @@
-FROM python:3.10 AS builder
+FROM python:3.12-slim
 
-WORKDIR /usr/src/app
-
-RUN python3 -m venv /venv
-ENV PATH="/venv/bin:$PATH"
-
-RUN pip install --upgrade pip
-
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-RUN pip install --no-cache-dir .
-
-
-FROM python:3.10 AS test_runner
-WORKDIR /tmp
-COPY --from=builder /venv /venv
-COPY --from=builder /usr/src/app/tests tests
-ENV PATH=/venv/bin:$PATH
-
-# install test dependencies
-RUN pip install pytest
-
-# run tests
-RUN pytest tests
-
-
-FROM python:3.10 AS service
-WORKDIR /root/app/site-packages
-COPY --from=test_runner /venv /venv
-ENV PATH=/venv/bin:$PATH
+RUN pip install --no-cache-dir --no-deps .
+EXPOSE 3000
+CMD ["uvicorn", "openapi_server.main:app", "--host", "0.0.0.0", "--port", "3000", "--ws-ping-interval", "15", "--ws-ping-timeout", "30"]
