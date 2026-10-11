@@ -204,7 +204,7 @@ paths:
                   authorDeadlineAt: { type: string, format: date-time }
         "403": { $ref: "#/components/responses/Forbidden" }
         "409":
-          description: Fewer than 4 players, or game in progress.
+          description: Fewer than 2 players, or game in progress.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }

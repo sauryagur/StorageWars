@@ -31,6 +31,8 @@ class Settings:
     room_ttl_seconds: float = 1800
     heartbeat_seconds: float = 15
     progress_coalesce_ms: int = 500
+    # Game-time multiplier. Durations below are divided by it, so 0.1 runs
+    # every phase 10x slower in real time. Timestamps stay real wall time.
     time_scale: float = 1.0
     seed_fixtures: bool = False
     media_root: str = "media"
@@ -45,6 +47,14 @@ def _float(name: str, default: float) -> float:
 
 
 def get_settings() -> Settings:
+    scale = _float("TIME_SCALE", 1.0)
+    if scale <= 0:
+        raise ValueError("TIME_SCALE must be positive")
+
+    def seconds(name: str, default: float) -> float:
+        """Real seconds a game-time duration lasts with this TIME_SCALE."""
+        return _float(name, default) / scale
+
     return Settings(
         database_url=os.getenv("DATABASE_URL", Settings.database_url),
         admin_token=os.getenv("ADMIN_TOKEN", ""),
@@ -53,7 +63,9 @@ def get_settings() -> Settings:
         public_base_url=os.getenv("PUBLIC_BASE_URL", "http://localhost:3000").rstrip(
             "/"
         ),
-        image_url_ttl_seconds=_int("IMAGE_URL_TTL_SECONDS", 300),
+        image_url_ttl_seconds=max(
+            1, int(round(seconds("IMAGE_URL_TTL_SECONDS", 300)))
+        ),
         cors_allow_origins=tuple(
             x.strip()
             for x in os.getenv(
@@ -61,20 +73,20 @@ def get_settings() -> Settings:
             ).split(",")
             if x.strip()
         ),
-        author_seconds=_float("AUTHOR_SECONDS", 60),
-        card_cap_seconds=_float("CARD_CAP_SECONDS", 20),
-        min_dwell_seconds=_float("MIN_DWELL_SECONDS", 3),
-        drip_bullets_seconds=_float("DRIP_BULLETS_SECONDS", 5),
-        drip_rating_seconds=_float("DRIP_RATING_SECONDS", 10),
-        slide_seconds=_float("SLIDE_SECONDS", 12),
-        vote_seconds=_float("VOTE_SECONDS", 30),
-        votekick_seconds=_float("VOTEKICK_SECONDS", 30),
-        rejoin_grace_seconds=_float("REJOIN_GRACE_SECONDS", 120),
-        seat_claim_seconds=_float("SEAT_CLAIM_SECONDS", 60),
-        room_ttl_seconds=_float("ROOM_TTL_SECONDS", 1800),
+        author_seconds=seconds("AUTHOR_SECONDS", 60),
+        card_cap_seconds=seconds("CARD_CAP_SECONDS", 20),
+        min_dwell_seconds=seconds("MIN_DWELL_SECONDS", 3),
+        drip_bullets_seconds=seconds("DRIP_BULLETS_SECONDS", 5),
+        drip_rating_seconds=seconds("DRIP_RATING_SECONDS", 10),
+        slide_seconds=seconds("SLIDE_SECONDS", 12),
+        vote_seconds=seconds("VOTE_SECONDS", 30),
+        votekick_seconds=seconds("VOTEKICK_SECONDS", 30),
+        rejoin_grace_seconds=seconds("REJOIN_GRACE_SECONDS", 120),
+        seat_claim_seconds=seconds("SEAT_CLAIM_SECONDS", 60),
+        room_ttl_seconds=seconds("ROOM_TTL_SECONDS", 1800),
         heartbeat_seconds=_float("HEARTBEAT_SECONDS", 15),
         progress_coalesce_ms=_int("PROGRESS_COALESCE_MS", 500),
-        time_scale=_float("TIME_SCALE", 1.0),
+        time_scale=scale,
         seed_fixtures=os.getenv("SEED_FIXTURES", "0") == "1",
         media_root=os.getenv("MEDIA_ROOT", "media"),
     )

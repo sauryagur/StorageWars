@@ -285,6 +285,53 @@ small,
   line-height: 1.5;
 }
 
+/* Submission feedback must be unmissable: the form clears on success and
+   server-rejected fields need to point at the offending input. */
+.form-status {
+  margin-bottom: 12px;
+  padding: 9px 11px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+.form-status.error {
+  background: var(--soft-pink);
+}
+
+.form-status.info {
+  background: var(--soft-mint);
+}
+
+.field-error {
+  margin-top: 4px;
+  color: #A31C5C;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.field-hint {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.submitted-panel {
+  min-width: 0;
+}
+
+.submitted-headline {
+  margin-bottom: 6px;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--purple);
+}
+
+.submitted-panel .detail-line {
+  margin-top: 12px;
+  margin-bottom: 0;
+}
+
 .lobby-layout {
   display: grid;
   grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
@@ -643,6 +690,155 @@ small,
   font-size: 11px;
 }
 
+.final-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 18px;
+}
+
+.final-heading .screen-subtitle {
+  max-width: 520px;
+}
+
+.final-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  min-width: min(100%, 280px);
+}
+
+.final-actions > button {
+  width: 100%;
+}
+
+.final-actions p {
+  margin: 0;
+}
+
+.final-replay-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.final-replay-form .field {
+  margin: 0;
+}
+
+.final-replay-form button {
+  min-height: 40px;
+}
+
+.final-rankings {
+  display: grid;
+  gap: 8px;
+}
+
+.final-ranking {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 10px 12px;
+  background: var(--panel);
+}
+
+.final-rank {
+  grid-row: 1 / span 2;
+  color: var(--purple);
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.final-player {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.final-player strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.final-winner-badge {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  background: var(--soft-yellow);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.final-total {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.1;
+}
+
+.final-total strong {
+  font-size: 18px;
+}
+
+.final-total span {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+}
+
+.final-breakdown {
+  grid-column: 2 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.final-breakdown strong {
+  margin-left: 3px;
+  color: var(--text);
+}
+
+.final-rankings .empty {
+  padding: 20px 0;
+}
+
+@media (max-width: 900px) {
+  .final-heading {
+    flex-direction: column;
+  }
+
+  .final-actions {
+    width: 100%;
+  }
+}
+
+@media (max-width: 620px) {
+  .final-replay-form {
+    grid-template-columns: 1fr;
+  }
+
+  .final-ranking {
+    grid-template-columns: 32px minmax(0, 1fr) auto;
+    column-gap: 8px;
+    padding: 9px;
+  }
+
+  .final-breakdown {
+    column-gap: 10px;
+  }
+}
+
 .distribution {
   margin-top: 20px;
   padding-top: 16px;
@@ -868,84 +1064,90 @@ button:disabled {
   }
 }
 
-/* --- Playful motion layer --- */
+/* Interaction feedback stays colour-only: looping transforms and focus
+   scale animations repaint the whole form on every click and keystroke. */
 
-/* Headings gently wobble instead of sitting perfectly still. */
-.screen-title {
-  transform-origin: 15% 80%;
-  animation: title-wiggle 4s ease-in-out infinite;
+.lock-hint {
+  margin-top: 10px;
+  font-size: var(--font-small);
+  color: var(--muted);
+  line-height: 1.5;
 }
 
-@keyframes title-wiggle {
-  0%, 86%, 100% { transform: rotate(0deg); }
-  89% { transform: rotate(-1.5deg); }
-  93% { transform: rotate(1.5deg); }
-  97% { transform: rotate(-0.5deg); }
+.reveal-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.65fr);
+  align-items: start;
+  gap: 24px;
 }
 
-/* Doodles drift and rotate independently. */
-.screen-title::after {
-  animation: doodle-drift 3s ease-in-out infinite;
+.reveal-layout .guess-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 18px;
 }
 
-@keyframes doodle-drift {
-  0%, 100% { transform: translateY(0) rotate(12deg); }
-  50% { transform: translateY(-5px) rotate(25deg); }
+.price-axis {
+  width: 100%;
+  height: auto;
+  margin: 10px 0 14px;
+  overflow: visible;
 }
 
-/* Buttons feel tactile when approached and clicked. */
-button {
-  transition:
-    transform 160ms cubic-bezier(.2, 1.8, .4, 1),
-    box-shadow 160ms ease,
-    background-color 160ms ease;
+.reveal-guess {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  border-top: 1px solid var(--border);
 }
 
-button:hover:not(:disabled) {
-  transform: translateY(-3px) rotate(-1deg);
+.reveal-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
 }
 
-button:active:not(:disabled) {
-  transform: translateY(2px) rotate(1deg) scale(.98);
+.reveal-guess-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* Player tiles have a small, staggered floating motion. */
-.player {
-  animation: player-float 3.8s ease-in-out infinite;
+.reveal-photo {
+  width: 100%;
+  max-height: 220px;
+  object-fit: contain;
+  margin: 8px 0;
+  border: 1px solid var(--border);
+  background: var(--panel);
 }
 
-.player:nth-child(2n) {
-  animation-delay: -1.2s;
+.reveal-price {
+  font-size: 30px;
+  font-weight: 800;
+  color: var(--purple);
+  margin-bottom: 6px;
 }
 
-.player:nth-child(3n) {
-  animation-delay: -2.4s;
+.vote-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  width: 100%;
+  margin-bottom: 10px;
+  padding: 14px;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: none;
 }
 
-@keyframes player-float {
-  0%, 100% { transform: translateY(0) rotate(0deg); }
-  50% { transform: translateY(-2px) rotate(.3deg); }
-}
-
-/* Inputs react slightly when focused. */
-input:focus,
-textarea:focus,
-select:focus {
-  animation: input-pop 180ms ease-out;
-}
-
-@keyframes input-pop {
-  0% { transform: scale(1); }
-  60% { transform: scale(1.012); }
-  100% { transform: scale(1); }
-}
-
-/* Respect users who prefer reduced motion. */
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation: none !important;
-    transition: none !important;
+@media (max-width: 900px) {
+  .reveal-layout {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
@@ -13,21 +12,18 @@ class Clock(Protocol):
 
 
 class SystemClock:
-    def __init__(self, scale: float = 1.0) -> None:
-        if scale <= 0:
-            raise ValueError("scale must be positive")
-        self._origin = datetime.now(timezone.utc)
-        self._started = time.monotonic()
-        self._scale = scale
+    """Wall-clock time source for every server-stamped timestamp.
+
+    Timestamps must be comparable with client wall clocks, otherwise a
+    countdown rendered by a client is nonsense. ``TIME_SCALE`` is therefore
+    applied to game durations in config, never to this clock.
+    """
 
     def now(self) -> datetime:
-        return self._origin + timedelta(
-            seconds=(time.monotonic() - self._started) * self._scale
-        )
+        return datetime.now(timezone.utc)
 
     async def sleep_until(self, deadline: datetime) -> None:
-        delay = max(0.0, (deadline - self.now()).total_seconds() / self._scale)
-        await asyncio.sleep(delay)
+        await asyncio.sleep(max(0.0, (deadline - self.now()).total_seconds()))
 
 
 class FakeClock:
@@ -78,9 +74,7 @@ _clock: Clock | None = None
 def get_clock() -> Clock:
     global _clock
     if _clock is None:
-        from openapi_server.impl.config import settings
-
-        _clock = SystemClock(settings.time_scale)
+        _clock = SystemClock()
     return _clock
 
 

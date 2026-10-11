@@ -26,6 +26,27 @@ def test_session_auth_wrong_room_unknown_token_and_create_rate_limit(client):
     assert int(limited.headers["Retry-After"]) >= 1
 
 
+def test_two_players_can_start_and_one_player_cannot(client):
+    host = create_room(client)
+    room_url = f"/v1/rooms/{host['roomCode']}"
+    headers = auth(host["sessionToken"])
+
+    solo_room = client.get(room_url, headers=headers)
+    assert solo_room.status_code == 200
+    assert solo_room.json()["canStart"] is False
+    solo_start = client.post(f"{room_url}/start", headers=headers)
+    assert solo_start.status_code == 409
+    assert solo_start.json()["code"] == "VALIDATION_FAILED"
+
+    join_player(client, host["roomCode"], "Player Two")
+    duo_room = client.get(room_url, headers=headers)
+    assert duo_room.status_code == 200
+    assert duo_room.json()["canStart"] is True
+
+    started = client.post(f"{room_url}/start", headers=headers)
+    assert started.status_code == 202, started.text
+    assert started.json()["phase"] == "AUTHOR"
+
 def begin_four_player_game(client):
     host = create_room(client)
     players = [host] + [

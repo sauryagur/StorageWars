@@ -162,8 +162,11 @@ class GuessApiImpl(BaseGuessApi):
                 "wasRounded": was_rounded,
                 "cardId": card_id,
                 "lockedAt": guess.locked_at,
-                "cardSeconds": guess.card_seconds,
-                "multiplier": guess.multiplier,
+                # The contract documents the 20s/0.7 design envelope for these two
+                # fields. A playtest cap longer than 20s must still serialize a valid
+                # response instead of failing validation with a 500.
+                "cardSeconds": min(20.0, float(guess.card_seconds or 0.0)),
+                "multiplier": max(0.7, float(guess.multiplier or 1.0)),
                 "nextCardId": next_card_id,
             }
         )

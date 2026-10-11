@@ -60,6 +60,71 @@ export interface AuthorCard {
   };
 }
 
+export interface RevealGuess {
+  playerName: string;
+  valueCents: number;
+  lockedAt: string;
+  cardSeconds?: number | null;
+  timedOut: boolean;
+}
+
+export interface RevealSlide {
+  slideIndex: number;
+  slideCount: number;
+  autoAdvanceAt: string;
+  canAdvance: boolean;
+  card: {
+    cardId: string;
+    authorName: string;
+    authored: {
+      title?: string | null;
+      bullets?: Array<string | null> | null;
+      starRating?: number | null;
+      reviewBucket?: string | null;
+      category?: string | null;
+    };
+    original: {
+      imageUrl?: string | null;
+      title?: string | null;
+      description?: string | null;
+      priceCents?: number | null;
+      snapshotDate?: string | null;
+      category?: string | null;
+    };
+    guesses: RevealGuess[];
+    axisMinCents: number;
+    axisMaxCents: number;
+  };
+}
+
+export interface VoteOptions {
+  options: Array<{
+    cardId: string;
+    authorName?: string | null;
+    title?: string | null;
+    category?: string | null;
+    starRating?: number | null;
+    reviewBucket?: string | null;
+  }>;
+  deadlineAt?: string | null;
+  myVoteCast?: boolean;
+}
+
+export interface ValueEcho {
+  valueCents: number;
+  formattedValue: string;
+  wasClamped: boolean;
+  wasRounded: boolean;
+}
+
+export interface LockResponse extends ValueEcho {
+  cardId: string;
+  lockedAt: string;
+  cardSeconds: number;
+  multiplier: number;
+  nextCardId?: string | null;
+}
+
 export interface GuessQueue {
   cards: Array<{ cardId: string; status: string }>;
   myPosition: {
@@ -101,10 +166,37 @@ export interface GameSnapshot {
   lobby?: { players?: RoomPlayer[] };
   author?: { card?: AuthorCard; submitted?: boolean; progress?: Record<string, number> };
   guess?: { queue?: GuessQueue; activeCard?: GuessCard };
-  reveal?: Record<string, unknown>;
-  vote?: Record<string, unknown>;
-  final?: Record<string, unknown>;
+  reveal?: RevealSlide;
+  vote?: VoteOptions;
+  final?: FinalScoreboard;
   [key: string]: unknown;
+}
+
+export interface FinalScoreboard {
+  endedReason: "COMPLETED" | "TOO_FEW_PLAYERS";
+  winnerPlayerId: string | null;
+  rankings: FinalRanking[];
+}
+
+export interface FinalRanking {
+  rank: number;
+  playerId: string;
+  name: string;
+  totalPoints: number;
+  breakdown: {
+    guesserPoints: number;
+    authorPoints: number;
+    funniestBonus: number;
+  };
+  perCard?: Array<{
+    cardId: string;
+    role: "GUESSER" | "AUTHOR";
+    status: string;
+    points?: number | null;
+    accuracy?: number | null;
+    lockedAt?: string | null;
+    funniestVotes?: number | null;
+  }> | null;
 }
 
 export interface AuthorSubmission {
@@ -120,15 +212,17 @@ export interface ApiErrorPayload {
   code?: string;
   message?: string;
   details?: unknown;
+  fieldErrors?: Array<{ field: string; rule: string; message: string }>;
 }
 
 export class ApiError extends Error {
-  constructor(
-    message: string,
-    public readonly status: number,
-    public readonly payload?: ApiErrorPayload,
-  ) {
+  readonly status: number;
+  readonly payload?: ApiErrorPayload;
+
+  constructor(message: string, status: number, payload?: ApiErrorPayload) {
     super(message);
+    this.status = status;
+    this.payload = payload;
     this.name = "ApiError";
   }
 }
@@ -275,30 +369,30 @@ export const api = {
     request<GuessCard>(`/games/current/guess/cards/${encodeURIComponent(cardId)}`),
 
   saveGuessDraft: (cardId: string, valueCents: number) =>
-    request<GuessCard>(
+    request<ValueEcho>(
       `/games/current/guess/cards/${encodeURIComponent(cardId)}/draft`,
       json("PUT", { valueCents: Math.round(valueCents) }),
     ),
 
   touchGuessSlider: (cardId: string) =>
-    request<GuessCard>(`/games/current/guess/cards/${encodeURIComponent(cardId)}/touch`, json("POST")),
+    request<void>(`/games/current/guess/cards/${encodeURIComponent(cardId)}/touch`, json("POST")),
 
   lockGuess: (cardId: string, valueCents: number) =>
-    request<GuessCard>(
+    request<LockResponse>(
       `/games/current/guess/cards/${encodeURIComponent(cardId)}/lock`,
       json("POST", { valueCents: Math.round(valueCents) }),
     ),
 
-  getReveal: <T = Record<string, unknown>>() => request<T>("/games/current/reveal"),
+  getReveal: () => request<RevealSlide>("/games/current/reveal"),
 
-  advanceReveal: () => request<Record<string, unknown>>("/games/current/reveal/advance", json("POST")),
+  advanceReveal: () => request<void>("/games/current/reveal/advance", json("POST")),
 
-  getVoteOptions: <T = Record<string, unknown>>() => request<T>("/games/current/vote/options"),
+  getVoteOptions: () => request<VoteOptions>("/games/current/vote/options"),
 
   vote: (cardId: string) =>
-    request<Record<string, unknown>>("/games/current/vote", json("POST", { cardId })),
+    request<void>("/games/current/vote", json("POST", { cardId })),
 
-  getFinal: <T = Record<string, unknown>>() => request<T>("/games/current/final"),
+  getFinal: () => request<FinalScoreboard>("/games/current/final"),
 
   report: (body: Record<string, unknown>) => request<Record<string, unknown>>("/reports", json("POST", body)),
 

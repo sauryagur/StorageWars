@@ -81,7 +81,7 @@ def room_state(room: Any, caller_id: str) -> RoomState:
         phase=phase,
         players=players,
         canStart=creator
-        and len(players) >= 4
+        and len(players) >= 2
         and len(players) <= 8
         and str(phase) in ("LOBBY", "Phase.LOBBY"),
         isCreator=creator,

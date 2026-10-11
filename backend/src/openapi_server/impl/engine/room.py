@@ -152,9 +152,9 @@ class RoomEngine:
             raise ApiError(403, "NOT_CREATOR")
         if self.phase != Phase.LOBBY:
             raise ApiError(409, "GAME_IN_PROGRESS")
-        if not 4 <= len(self.seats) <= 8:
+        if not 2 <= len(self.seats) <= 8:
             raise ApiError(
-                409, "VALIDATION_FAILED", "A room needs 4–8 players to start."
+                409, "VALIDATION_FAILED", "A room needs 2–8 players to start."
             )
         if len(products) != len(self.seats):
             raise ValueError("one distinct product per seated player is required")

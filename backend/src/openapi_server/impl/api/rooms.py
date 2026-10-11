@@ -133,7 +133,7 @@ class RoomsApiImpl(BaseRoomsApi):
                 "players": players,
                 "canStart": player.id == room.creator_player_id
                 and room.phase.value == "LOBBY"
-                and 4 <= len(room.seats) <= 8,
+                and 2 <= len(room.seats) <= 8,
                 "isCreator": player.id == room.creator_player_id,
                 "ttlExpiresAt": room.ttl_expires_at,
             }
@@ -149,9 +149,9 @@ class RoomsApiImpl(BaseRoomsApi):
             raise ApiError(403, "NOT_CREATOR")
         if room.phase.value != "LOBBY":
             raise ApiError(409, "GAME_IN_PROGRESS")
-        if not 4 <= len(room.seats) <= 8:
+        if not 2 <= len(room.seats) <= 8:
             raise ApiError(
-                409, "VALIDATION_FAILED", "A room needs 4–8 players to start."
+                409, "VALIDATION_FAILED", "A room needs 2–8 players to start."
             )
         products = await sample_products(len(room.seats), room.rng)
         room.start(products, session.player_id)
